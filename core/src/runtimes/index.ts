@@ -101,8 +101,8 @@ export class Runtimes {
   public async compact(ctx: ChannelContext): Promise<string> {
     const runtime = this.runtimes.get(runtimeKey(ctx));
     if (!runtime) throw new Error("No active Runtime is available to compact this conversation");
-    const result = (await runtime.compact("manual")) as { compacted: boolean };
-    return result.compacted ? "已压缩当前会话。" : "消息不足，未压缩。";
+    const result = await runtime.compact("manual");
+    return describeCompactResult(result);
   }
 
   public async archive(ctx: ChannelContext, noSummary = false): Promise<string> {
@@ -165,9 +165,30 @@ export class Runtimes {
     return vision.entry.modalities?.input?.includes("image") ? vision.model : undefined;
   }
 
+  /**
+   * 频道级串行（get / reset / archive 互斥）。
+   * 加排队与执行时长看门狗：这条 tail 一旦被一个永不 settle 的任务占住，
+   * 该频道的 get()/reset() 也会跟着静默卡死，所以至少要能在日志里看见。
+   */
   private async serialize(key: string, task: () => Promise<void>): Promise<void> {
     const previous = this.tails.get(key) ?? Promise.resolve();
-    const next = previous.then(task, task);
+    const enqueuedAt = Date.now();
+    const guarded = async (): Promise<void> => {
+      const waitedMs = Date.now() - enqueuedAt;
+      if (waitedMs >= 5_000) {
+        this.logger.warn("runtimes.serialize.lag", { key, waitedMs });
+      }
+      const startedAt = Date.now();
+      try {
+        await task();
+      } finally {
+        const tookMs = Date.now() - startedAt;
+        if (tookMs >= 30_000) {
+          this.logger.warn("runtimes.serialize.slow", { key, tookMs });
+        }
+      }
+    };
+    const next = previous.then(guarded, guarded);
     const settled = next.then(
       () => undefined,
       () => undefined,
@@ -186,6 +207,25 @@ export class Runtimes {
 
   private runtimeCount(): number {
     return [...this.runtimes.values()].length;
+  }
+}
+
+function describeCompactResult(result: { compacted: boolean; reason?: string; degraded?: boolean }): string {
+  if (result.compacted) return "已压缩当前会话。";
+  if (result.degraded) return "模型压缩不可用，已降级为截断最老消息。";
+  switch (result.reason) {
+    case "minimum_messages":
+      return "消息不足，未压缩。";
+    case "empty_input":
+      return "没有可压缩的文本内容，未压缩。";
+    case "failure_limit":
+      return "压缩连续失败，正在退避重试中，本次跳过。";
+    case "timeout":
+      return "压缩超时，本次跳过。";
+    case "stopped":
+      return "频道正在停止，未压缩。";
+    default:
+      return `未压缩（${result.reason ?? "unknown"}）。`;
   }
 }
 

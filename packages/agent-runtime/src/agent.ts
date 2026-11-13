@@ -1,10 +1,10 @@
-import { isLoopFinished, streamText, type LanguageModel, type LanguageModelUsage, type SystemModelMessage, type ToolSet } from "ai";
+import { hasToolCall, isLoopFinished, stepCountIs, streamText, type LanguageModel, type LanguageModelUsage, type SystemModelMessage, type ToolSet } from "ai";
 import { z } from "zod";
 
 import { AgentChannel, createAgentChannel } from "./channel.js";
 import type { AgentEntry } from "./entry.js";
 import { createEventEntry, createMessageEntry } from "./entry.js";
-import { formatErrorCause, ToolConflictError } from "./errors.js";
+import { formatErrorCause, ToolConflictError, ToolTimeoutError } from "./errors.js";
 import type { AgentInternalEvent, AgentInternalEventInit } from "./event.js";
 import { createDiagnostic, createInternalEvent } from "./event.js";
 import type { AgentMessage } from "./message.js";
@@ -23,6 +23,21 @@ export interface AgentSendOptions {
   ifBusy?: "defer" | "join" | "reject";
 }
 
+/** createAgent 侧最小日志接口（与 koishi Logger.warn 签名兼容） */
+export interface AgentRuntimeLogger {
+  warn?(message: string, meta?: unknown): void;
+}
+
+/**
+ * 单次工具执行的默认上限（毫秒）。
+ * 超时只结束本轮等待（记 tool.timeout + tool.failed），不会杀掉工具本身，
+ * 也不会把整轮 abort 伪装成「用户中断」。
+ */
+export const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
+
+/** 单轮步数上限（含工具循环）。正常一轮通常 3~10 步，40 足够宽松。 */
+export const DEFAULT_MAX_STEPS = 40;
+
 export interface AgentConfig {
   id?: string;
   model: LanguageModel;
@@ -34,6 +49,15 @@ export interface AgentConfig {
   terminalTool?: { name: string; description?: string };
   initialState?: AgentState;
   defaultState?: AgentState;
+  /** 单次工具执行上限（毫秒），默认 {@link DEFAULT_TOOL_TIMEOUT_MS}；<=0 表示不设上限 */
+  toolTimeoutMs?: number;
+  /** 按对外工具名覆盖超时（毫秒），优先于 toolTimeoutMs */
+  toolTimeouts?: Record<string, number>;
+  /** interrupt() 等待 turn 收尾的上限（毫秒），默认 3000；超时后放弃等待并让队列继续 */
+  interruptTimeoutMs?: number;
+  /** 单轮最多几步（含工具循环），默认 40；防止模型反复调用同一个工具把一轮拖成无限循环 */
+  maxSteps?: number;
+  logger?: AgentRuntimeLogger;
 }
 
 export interface Agent {
@@ -212,6 +236,7 @@ export function createAgent(config: AgentConfig): Agent {
     for (const tool of merged) {
       const toolName = tool.name;
       const execute = tool.execute;
+      const timeoutMs = resolveToolTimeout(config, toolName);
       const wrappedTool: AgentTool = {
         ...tool,
         execute: execute
@@ -233,6 +258,17 @@ export function createAgent(config: AgentConfig): Agent {
 
                 await emitInternal({ type: "tool.start", turnId, toolName, toolCallId: options.toolCallId, args: nextInput });
 
+                // 每次工具执行一个独立 abort 控制器：链路到 turn signal，超时只中止这一个工具。
+                const toolController = new AbortController();
+                const forwardAbort = () => toolController.abort(hookContext.signal?.reason);
+                if (hookContext.signal) {
+                  if (hookContext.signal.aborted) {
+                    forwardAbort();
+                  } else {
+                    hookContext.signal.addEventListener("abort", forwardAbort, { once: true });
+                  }
+                }
+
                 try {
                   const executeContext: AgentToolExecuteContext = {
                     ...options,
@@ -241,9 +277,25 @@ export function createAgent(config: AgentConfig): Agent {
                     state,
                     storage,
                     turnId,
-                    abortSignal: hookContext.signal,
+                    abortSignal: toolController.signal,
                   };
-                  const output = await raceAbort(Promise.resolve(execute(nextInput, executeContext)), hookContext.signal);
+                  const output = await withToolDeadline(Promise.resolve(execute(nextInput, executeContext)), {
+                    turnId,
+                    toolName,
+                    toolCallId: options.toolCallId,
+                    timeoutMs,
+                    signal: hookContext.signal,
+                    logger: config.logger,
+                    onTimeout: () => {
+                      void emitInternal({ type: "tool.timeout", turnId, toolName, toolCallId: options.toolCallId, timeoutMs });
+                      return new ToolTimeoutError(toolName, timeoutMs);
+                    },
+                    onAbandon: () => {
+                      if (!toolController.signal.aborted) {
+                        toolController.abort(new ToolTimeoutError(toolName, timeoutMs));
+                      }
+                    },
+                  });
                   throwIfAborted(hookContext.signal);
                   const result = await pluginHost.helpers.afterToolCall(
                     { toolCallId: options.toolCallId, toolName, args: nextInput, result: output, isError: false },
@@ -261,6 +313,8 @@ export function createAgent(config: AgentConfig): Agent {
 
                   await emitInternal({ type: "tool.failed", turnId, toolName, toolCallId: options.toolCallId, error: diagnostic, args: nextInput });
                   throw error;
+                } finally {
+                  hookContext.signal?.removeEventListener("abort", forwardAbort);
                 }
               });
 
@@ -406,7 +460,15 @@ export function createAgent(config: AgentConfig): Agent {
           system: frozenSystemPrompt,
           messages: modelMessages,
           tools: { ...toAiToolSet(resolveTools(request.turnId, abortSignal)), ...frozenProviderTools },
-          stopWhen: isLoopFinished(),
+          stopWhen: [
+            isLoopFinished(),
+            // 终结工具（finalize）一旦被调用就该结束本轮：模型经常反复调用它，
+            // 而 finishReason 一直是 tool-calls，isLoopFinished() 永远为 false，
+            // 于是一轮能跑出上百步、每步 ~100k input tokens，并且把频道串行锁占死。
+            ...(baseTerminalTool ? [hasToolCall(baseTerminalTool.name)] : []),
+            // 兜底步数上限：任何工具循环都不会无限跑下去。
+            stepCountIs(config.maxSteps && config.maxSteps > 0 ? config.maxSteps : DEFAULT_MAX_STEPS),
+          ],
           abortSignal,
           prepareStep: async ({ stepNumber }) => {
             let messages = modelMessages;
@@ -510,7 +572,22 @@ export function createAgent(config: AgentConfig): Agent {
     }
   };
 
-  const turnQueue = createTurnQueue({ onRun: executeTurn });
+  const turnQueue = createTurnQueue({
+    onRun: executeTurn,
+    interruptTimeoutMs: config.interruptTimeoutMs,
+    logger: config.logger,
+    onAbandon: (info) => {
+      // turn.abandoned 同时是 turn 流的终止事件，消费者不会挂在永不关闭的流上。
+      void emitInternal({
+        type: "turn.abandoned",
+        turnId: info.turnId,
+        elapsedMs: info.elapsedMs,
+        timeoutMs: info.timeoutMs,
+        queueLength: info.queueLength,
+        reason: info.reason === undefined ? undefined : String(info.reason),
+      });
+    },
+  });
 
   const agent: Agent = {
     id,
@@ -635,7 +712,64 @@ function isTurnScopedEvent(event: AgentInternalEvent): event is AgentInternalEve
 }
 
 function isTerminalTurnEvent(event: AgentInternalEvent) {
-  return event.type === "turn.done" || event.type === "turn.failed" || event.type === "turn.aborted";
+  return event.type === "turn.done" || event.type === "turn.failed" || event.type === "turn.aborted" || event.type === "turn.abandoned";
+}
+
+function resolveToolTimeout(config: AgentConfig, toolName: string): number {
+  const override = config.toolTimeouts?.[toolName];
+  if (typeof override === "number") {
+    return override;
+  }
+
+  return config.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+}
+
+interface ToolDeadlineOptions {
+  readonly turnId: string;
+  readonly toolName: string;
+  readonly toolCallId?: string;
+  readonly timeoutMs: number;
+  readonly signal?: AbortSignal;
+  readonly logger?: AgentRuntimeLogger;
+  readonly onTimeout: () => Error;
+  readonly onAbandon?: () => void;
+}
+
+/**
+ * 工具执行硬上限。MCP 这类 `callTool` 没有自带 timeout（plugins/mcp-client 里也没有），
+ * 一旦上游不返回，工具 promise 永不 settle —— turn 不结束、interrupt() 无限等、频道串行锁永不释放。
+ * 这里统一加一道 race：超时抛 ToolTimeoutError，让 turn 正常走到 tool.failed / 结束。
+ */
+async function withToolDeadline<T>(operation: Promise<T>, options: ToolDeadlineOptions): Promise<T> {
+  const raced = options.signal ? raceAbort(operation, options.signal) : operation;
+  if (!(options.timeoutMs > 0)) {
+    return raced;
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        options.logger?.warn?.(`工具 ${options.toolName} 执行超过 ${options.timeoutMs}ms，放弃等待（tool.timeout）`, {
+          turnId: options.turnId,
+          toolName: options.toolName,
+          toolCallId: options.toolCallId,
+          timeoutMs: options.timeoutMs,
+        });
+        reject(options.onTimeout());
+        // 先让超时错误赢得 race，再中止工具自身的 signal（合作型工具可据此收尾）。
+        const abandon = options.onAbandon;
+        if (abandon) {
+          setTimeout(abandon, 0);
+        }
+      }, options.timeoutMs);
+    });
+    return await Promise.race([raced, timedOut]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 async function resolveConfiguredSystemPrompt(input: AgentConfig["systemPrompt"], runtime: AgentPluginRuntime): Promise<ResolvedSystemPrompt> {

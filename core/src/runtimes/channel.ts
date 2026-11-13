@@ -20,6 +20,7 @@ import {
 import type { WillEngine, WillState } from "../agents/will.js";
 import { type Channel, type ChannelContext, deriveChannelKey } from "../channels/index.js";
 import type { Config } from "../config.js";
+import type { CompactReason, CompactResult } from "../conversations/index.js";
 import {
   createEvent,
   createMessage,
@@ -86,6 +87,14 @@ export interface ChannelRuntimeOptions {
   readonly compactTriggerTokens?: number;
   readonly compactFallbackTurns?: number;
   readonly archiveMaxBytes?: number;
+  /** interrupt() 等待 turn 收尾的上限（毫秒），超时即放弃等待并释放串行队列（默认 3000） */
+  readonly interruptTimeoutMs?: number;
+  /** stop() 各阶段（队尾/interrupt/agent.stop/流）等待上限（毫秒，默认 5000） */
+  readonly stopTimeoutMs?: number;
+  /** 单次压缩 LLM 调用上限（毫秒，默认 90000） */
+  readonly compactTimeoutMs?: number;
+  /** 单次工具执行上限（毫秒），默认交给 agent-runtime（120s） */
+  readonly toolTimeoutMs?: number;
 }
 
 export class ChannelRuntime {
@@ -107,6 +116,16 @@ export class ChannelRuntime {
   private turnsSinceCompact = 0;
   /** 压缩已判定需要执行、但当时正忙，等空闲窗口立即执行 */
   private forceCompactPending = false;
+  /** 压缩独立车道的队尾：与入站消息的 schedule 完全解耦 */
+  private compactTail: Promise<void> = Promise.resolve();
+  /** 正在跑（或排队中）的那次压缩，用来合并重复请求 */
+  private compactInFlight: Promise<CompactResult> | undefined;
+  /** 入站车道上一次请求压缩的时间（节流，避免每条消息都触发一次读盘） */
+  private lastCompactRequestAt = 0;
+  /** schedule 里还在排队的任务数，用于「排队中」可观测性 */
+  private pendingTasks = 0;
+  /** 排队/执行超过这个时长就打 warn（毫秒） */
+  private readonly queueWarnMs = 5_000;
 
   private persona = "";
   private lastPersistedInput: Message | Event | undefined;
@@ -151,6 +170,9 @@ export class ChannelRuntime {
     this.agent = createAgent({
       id: deriveChannelKey(this.context),
       model: options.model,
+      logger: this.logger,
+      interruptTimeoutMs: options.interruptTimeoutMs,
+      toolTimeoutMs: options.toolTimeoutMs,
       storage: options.channel.conversation.storage,
       systemPrompt: () =>
         buildCoreSystemPrompt({
@@ -216,7 +238,7 @@ export class ChannelRuntime {
   }
 
   public handle(record: MessageRecord | EventRecord): Promise<RuntimeResult> {
-    return this.schedule(async () => {
+    return this.schedule("handle", async () => {
       const input = await this.persist(record);
       await this.archiveIfOversize();
       const decision = await this.options.will.decide(input, this.state());
@@ -235,7 +257,7 @@ export class ChannelRuntime {
   public post(event: EventRecord, options: PostOptions = {}): Promise<RuntimeResult> {
     const trigger = options.trigger ?? true;
     const ifBusy = options.ifBusy ?? "defer";
-    return this.schedule(async () => {
+    return this.schedule("post", async () => {
       this.assertOpen();
       if (trigger && ifBusy === "reject" && this.agent.getActiveTurnId() !== null) throw new AgentBusyError();
       const input = await this.persist(event);
@@ -247,7 +269,7 @@ export class ChannelRuntime {
   }
 
   public nudge(options?: NudgeOptions): Promise<RuntimeResult> {
-    return this.schedule(async () => {
+    return this.schedule("nudge", async () => {
       const ifBusy = options?.ifBusy ?? "reject";
       if (this.stopped || !this.lastPersistedInput) {
         return { kind: "wait" as const, eventId: "" };
@@ -268,7 +290,7 @@ export class ChannelRuntime {
   }
 
   public fail(eventId: string, cause: unknown, delivery?: { turnId: string; messageId: string; segmentIndex: number; segmentTotal: number }): Promise<void> {
-    return this.schedule(async () => {
+    return this.schedule("fail", async () => {
       const input = createEvent({
         eventType: "delivery.failed",
         platform: this.context.platform,
@@ -293,19 +315,132 @@ export class ChannelRuntime {
     return this.agent.wait();
   }
 
-  public compact(reason: "auto" | "idle" | "manual"): Promise<unknown> {
-    return this.schedule(async () => {
-      const result = await this.options.channel.conversation.compact(reason, {
+  /**
+   * 压缩在**独立车道**（compactTail）上跑，不再占 schedule 的队尾：
+   * 入站消息只排在 turn / persist 后面，不会排在一次可能很慢的 LLM 压缩后面。
+   * 同一时刻只保留一次压缩，重复的 auto/idle 请求合并到正在跑的那次。
+   */
+  public compact(reason: CompactReason): Promise<CompactResult> {
+    if (this.stopped) return Promise.resolve({ compacted: false, reason: "stopped" });
+    if (reason !== "manual" && this.compactInFlight) {
+      this.logger.debug("runtime.compact.coalesced", { reason });
+      return this.compactInFlight;
+    }
+
+    const run = (): Promise<CompactResult> => this.runCompact(reason);
+    const result = this.compactTail.then(run, run);
+    this.compactTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.compactInFlight = result;
+    const clear = () => {
+      if (this.compactInFlight === result) this.compactInFlight = undefined;
+    };
+    void result.then(clear, clear);
+    return result;
+  }
+
+  /**
+   * 压缩一次，并在出入口各打一条 info（耗时 / 条目数 / 是否成功）。
+   * 这是排查「频道卡住多久」的唯一抓手：改前压缩成功时全静默。
+   */
+  private async runCompact(reason: CompactReason): Promise<CompactResult> {
+    const conversation = this.options.channel.conversation;
+    const startedAt = Date.now();
+    // 入场日志不打读盘快照：压缩本身就要读全文，这里再读一次纯属浪费，
+    // 也会在（fake timer 之类的）临界路径上多插一次 I/O。
+    this.logger.info("runtime.compact.start", {
+      reason,
+      failures: conversation.failuresCount(),
+      turnsSinceCompact: this.turnsSinceCompact,
+      lastInputTokens: this.lastInputTokens,
+    });
+
+    let result: CompactResult;
+    try {
+      result = await conversation.compact(reason, {
         model: this.options.compactModel ?? this.options.model,
         personaName: "月见诗音",
         persona: this.persona,
+        timeoutMs: this.options.compactTimeoutMs,
       });
-      if (result.compacted) {
-        this.turnsSinceCompact = 0;
-        this.lastInputTokens = undefined;
-        await this.archiveIfOversize();
-      }
-      return result;
+    } catch (cause) {
+      this.logger.warn("runtime.compact.error", {
+        reason,
+        elapsedMs: Date.now() - startedAt,
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
+      throw cause;
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    const after = await this.compactSnapshot();
+    if (result.compacted) {
+      this.turnsSinceCompact = 0;
+      this.lastInputTokens = undefined;
+    }
+    this.logger.info("runtime.compact.end", {
+      reason,
+      ok: result.compacted,
+      code: result.reason ?? "ok",
+      degraded: result.degraded ?? false,
+      elapsedMs,
+      entries: after.entries,
+      messages: after.messages,
+      bytes: after.bytes,
+      failures: conversation.failuresCount(),
+      retryInMs: conversation.compactBackoffRemainingMs(),
+    });
+
+    if (result.degraded) {
+      this.logger.warn("runtime.compact.degraded", {
+        reason,
+        messages: after.messages,
+        bytes: after.bytes,
+        failures: conversation.failuresCount(),
+        retryInMs: conversation.compactBackoffRemainingMs(),
+      });
+    } else if (result.reason === "failure_limit") {
+      this.logger.warn("runtime.compact.backoff", {
+        reason,
+        failures: conversation.failuresCount(),
+        retryInMs: conversation.compactBackoffRemainingMs(),
+      });
+    }
+
+    if (result.compacted || result.degraded) {
+      // 换会话放在消息车道里做（scheduleArchiveCheck 只在空闲时动手），
+      // 避免和正在写入的 turn 抢同一个会话文件。
+      this.scheduleArchiveCheck();
+    }
+    return result;
+  }
+
+  private async compactSnapshot(): Promise<{ entries: number; messages: number; bytes: number }> {
+    try {
+      const conversation = this.options.channel.conversation;
+      const entries = await conversation.storage.read();
+      const active = (await conversation.status()).active;
+      return {
+        entries: entries.length,
+        messages: entries.filter((entry) => entry.type === "message").length,
+        bytes: active?.size ?? 0,
+      };
+    } catch (cause) {
+      this.logger.debug("runtime.compact.snapshot.failed", { error: cause instanceof Error ? cause.message : String(cause) });
+      return { entries: -1, messages: -1, bytes: -1 };
+    }
+  }
+
+  /** 请求一次压缩；minIntervalMs 节流，避免每条消息都触发（读盘 + 排队）。 */
+  private requestCompact(reason: CompactReason, minIntervalMs = 30_000): void {
+    if (this.stopped) return;
+    const now = Date.now();
+    if (now - this.lastCompactRequestAt < minIntervalMs) return;
+    this.lastCompactRequestAt = now;
+    void this.compact(reason).catch((cause) => {
+      this.logger.warn("runtime.compact.request.failed", { reason, error: cause instanceof Error ? cause.message : String(cause) });
     });
   }
 
@@ -314,12 +449,53 @@ export class ChannelRuntime {
     this.stopped = true;
     this.clearIdleTimer();
     for (const controller of this.controllers) controller.abort();
-    this.stopTask = this.schedule(async () => {
-      await this.agent.interrupt("stop");
-      await this.agent.stop();
-      await Promise.allSettled([...this.streams]);
-    });
+    this.stopTask = this.stopInternal();
     return this.stopTask;
+  }
+
+  /**
+   * stop 不排在 schedule 队尾后面死等：先给队尾一个有限窗口收尾，
+   * 然后无论如何自己跑一遍，每一步都有上限。任何一步超时只记 warn，不再无限等。
+   */
+  private async stopInternal(): Promise<void> {
+    const timeoutMs = this.options.stopTimeoutMs ?? 5_000;
+    await this.withDeadline(this.tail.catch(() => undefined), timeoutMs, "schedule.tail", true);
+    await this.withDeadline(this.agent.interrupt("stop"), timeoutMs, "agent.interrupt", true);
+    await this.withDeadline(this.agent.stop(), timeoutMs, "agent.stop", true);
+    await this.withDeadline(Promise.allSettled([...this.streams]), timeoutMs, "agent.streams", true);
+    this.logger.debug("runtime.stop.done", { streams: this.streams.size, pendingTasks: this.pendingTasks });
+  }
+
+  /** Promise.race + 上限；超时记 warn。swallow=true 时不抛错（stop 路径必须走完）。 */
+  private async withDeadline<T>(work: Promise<T> | T, timeoutMs: number, label: string, swallow: boolean): Promise<T | undefined> {
+    const startedAt = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const settled = Promise.resolve(work).then(
+        (value) => ({ status: "ok" as const, value }),
+        (error: unknown) => ({ status: "error" as const, error }),
+      );
+      const timeout = new Promise<{ status: "timeout" }>((resolve) => {
+        timer = setTimeout(() => resolve({ status: "timeout" as const }), timeoutMs);
+      });
+      const outcome = await Promise.race([settled, timeout]);
+      if (outcome.status === "timeout") {
+        this.logger.warn("runtime.stop.timeout", { label, timeoutMs, elapsedMs: Date.now() - startedAt });
+        if (swallow) return undefined;
+        throw new Error(`${label} timed out after ${timeoutMs}ms`);
+      }
+      if (outcome.status === "error") {
+        this.logger.warn("runtime.stop.failed", {
+          label,
+          error: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+        });
+        if (swallow) return undefined;
+        throw outcome.error;
+      }
+      return outcome.value;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async persist(record: MessageRecord | EventRecord): Promise<Message | Event> {
@@ -397,6 +573,15 @@ export class ChannelRuntime {
           this.logger.warn("runtime.tool.failed", { turnId: event.turnId, toolName: event.toolName, toolCallId: event.toolCallId, error: event.error.message });
           continue;
         }
+        if (event.type === "tool.timeout") {
+          this.logger.warn("runtime.tool.timeout", {
+            turnId: event.turnId,
+            toolName: event.toolName,
+            toolCallId: event.toolCallId,
+            timeoutMs: event.timeoutMs,
+          });
+          continue;
+        }
         if (event.type === "message.appended" && "turnId" in event && event.message.role === "assistant") {
           turnId = event.turnId;
           const content = renderAssistantText(event.message.content);
@@ -417,6 +602,18 @@ export class ChannelRuntime {
           this.logger.warn("runtime.turn.aborted", { turnId: event.turnId, reason: event.reason });
           throw new Error("Agent turn aborted");
         }
+        if (event.type === "turn.abandoned") {
+          // interrupt 已放弃跟踪这个 turn：不要再等它，直接收尾消费者，
+          // 否则 output 永不 close、streams 永不清空、投递锁也跟着一起挂住。
+          this.logger.warn("runtime.turn.abandoned", {
+            turnId: event.turnId,
+            elapsedMs: event.elapsedMs,
+            timeoutMs: event.timeoutMs,
+            queueLength: event.queueLength,
+            reason: event.reason,
+          });
+          break;
+        }
       }
       completed = true;
       if (passive && assistant) await this.options.will.observe?.({ turnId, status: "done", messages: [] });
@@ -431,7 +628,7 @@ export class ChannelRuntime {
         this.resetIdleTimer();
       } else if (this.responseCompactionPending && idle) {
         this.responseCompactionPending = false;
-        void this.compact("idle");
+        this.requestCompact("idle", 0);
       }
       this.scheduleArchiveCheck();
       // 体积轴 / 轮次轴强制压缩：回复已 close，用户不感知；压缩经 schedule 串行排在当前 turn 之后。
@@ -464,6 +661,10 @@ export class ChannelRuntime {
         overTokens,
         overTurns,
       });
+      // 关键：consume 的 finally 跑在 turn 真正 settle 之前，那一刻 getActiveTurnId() 往往还不是 null，
+      // 只置位不重试会让「强制压缩」一直等不到下一个空闲窗口（上下文继续涨）。
+      // 这里在消息车道上排一次检查：车道一空就一定看得到 idle。
+      this.scheduleIdleCompactCheck();
       return;
     }
     this.forceCompactPending = false;
@@ -473,15 +674,40 @@ export class ChannelRuntime {
       overTokens,
       overTurns,
     });
-    void this.compact("auto");
+    this.requestCompact("auto", 0);
   }
 
   private state(): WillState {
     return { activeTurnId: this.agent.getActiveTurnId() };
   }
 
-  private schedule<T>(task: () => Promise<T>): Promise<T> {
-    const result = this.tail.then(task, task);
+  /**
+   * 入站车道：同一频道内串行。带排队/执行时长看门狗 ——
+   * 改前排队完全静默，堵住时日志里看不出一句「排队中」。
+   */
+  private schedule<T>(label: string, task: () => Promise<T>): Promise<T> {
+    const enqueuedAt = Date.now();
+    const depth = this.pendingTasks;
+    this.pendingTasks += 1;
+
+    const run = async (): Promise<T> => {
+      const waitedMs = Date.now() - enqueuedAt;
+      this.pendingTasks -= 1;
+      if (waitedMs >= this.queueWarnMs) {
+        this.logger.warn("runtime.schedule.lag", { label, waitedMs, depth });
+      }
+      const startedAt = Date.now();
+      try {
+        return await task();
+      } finally {
+        const tookMs = Date.now() - startedAt;
+        if (tookMs >= this.queueWarnMs) {
+          this.logger.warn("runtime.schedule.slow", { label, tookMs, depth });
+        }
+      }
+    };
+
+    const result = this.tail.then(run, run);
     this.tail = result.then(
       () => undefined,
       () => undefined,
@@ -493,22 +719,42 @@ export class ChannelRuntime {
     if (this.stopped) throw new Error("Channel runtime is stopped");
   }
 
+  /** 在消息车道上排一次「空闲就执行待办的强制压缩」的检查（不阻塞入站，只是顺带排在队尾）。 */
+  private scheduleIdleCompactCheck(): void {
+    if (this.stopped) return;
+    void this.schedule("compact-check", async () => {
+      if (this.stopped || !this.forceCompactPending) return;
+      if (this.agent.getActiveTurnId() !== null) return;
+      this.forceCompactPending = false;
+      this.requestCompact("auto", 0);
+    });
+  }
+
   private scheduleArchiveCheck(): void {
     if (this.stopped || (this.options.archiveMaxBytes ?? 0) <= 0) return;
-    void this.schedule(async () => {
+    void this.schedule("archive-check", async () => {
       if (this.stopped || this.agent.getActiveTurnId() !== null) return;
       await this.archiveIfOversize();
     });
   }
 
+  /**
+   * 入站车道里的体积检查：只做「已有摘要就换会话」这种廉价操作。
+   * 没有摘要时**不在这里跑 LLM 压缩**（那会把整条频道堵在一次慢调用后面），
+   * 而是把压缩丢给独立车道，压完再由 scheduleArchiveCheck 完成换会话。
+   */
   private async archiveIfOversize(): Promise<void> {
     const maxBytes = this.options.archiveMaxBytes ?? 0;
     if (this.stopped || maxBytes <= 0) return;
-    await this.options.channel.conversation.archiveIfOversize(maxBytes, {
-      model: this.options.compactModel ?? this.options.model,
-      personaName: "月见诗音",
-      persona: this.persona,
-    });
+    const conversation = this.options.channel.conversation;
+    if (await conversation.archiveIfOversize(maxBytes, undefined, { requireSummary: true })) {
+      this.logger.debug("runtime.archive.done", { maxBytes });
+      return;
+    }
+    const active = (await conversation.status()).active;
+    if (!active || active.size <= maxBytes) return;
+    this.logger.debug("runtime.archive.deferred", { bytes: active.size, maxBytes });
+    this.requestCompact("auto");
   }
 
   private resetIdleTimer(): void {
@@ -520,7 +766,7 @@ export class ChannelRuntime {
         this.responseCompactionPending = true;
         return;
       }
-      void this.compact("idle");
+      this.requestCompact("idle", 0);
     }, this.options.idleTimeout);
   }
 

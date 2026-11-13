@@ -22,6 +22,18 @@ export class ToolConflictError extends AgentRuntimeError {
   }
 }
 
+export class ToolTimeoutError extends AgentRuntimeError {
+  readonly toolName: string;
+  readonly timeoutMs: number;
+
+  constructor(toolName: string, timeoutMs: number) {
+    super(`Tool ${toolName} timed out after ${timeoutMs}ms`);
+    this.name = "ToolTimeoutError";
+    this.toolName = toolName;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export function formatErrorCause(error: unknown): string {
   if (error instanceof Error) {
     return `${error.name}: ${error.message}`;

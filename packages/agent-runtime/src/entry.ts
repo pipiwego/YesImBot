@@ -10,6 +10,8 @@ export interface CompactEntryData {
   summary: string;
   lastEntryId: string;
   sourceSession?: string;
+  /** 模型压缩不可用时的降级截断（丢弃最老消息），由 conversations 侧写入 */
+  degraded?: boolean;
 }
 export interface AgentCustomEntries {
   compact: CompactEntryData;

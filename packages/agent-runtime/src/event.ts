@@ -16,11 +16,13 @@ export type AgentInternalEventInit =
   | TurnDoneEvent
   | TurnFailedEvent
   | TurnAbortedEvent
+  | TurnAbandonedEvent
   | MessageAppendedEvent
   | ToolStartEvent
   | ToolDoneEvent
   | ToolFailedEvent
   | ToolBlockedEvent
+  | ToolTimeoutEvent
   | PluginErrorEvent
   | PluginDisabledEvent;
 
@@ -87,6 +89,21 @@ export interface TurnAbortedEvent extends TurnScoped {
   reason?: string;
 }
 
+/**
+ * interrupt() 等不到 turn 收尾、放弃等待后发出。
+ * 这是 turn 流上的终止事件：消费者必须据此收尾，不能再等 turn.done。
+ */
+export interface TurnAbandonedEvent extends TurnScoped {
+  type: "turn.abandoned";
+  /** 该 turn 从开始执行到被放弃的时长（毫秒） */
+  elapsedMs: number;
+  /** interrupt() 使用的等待上限（毫秒） */
+  timeoutMs: number;
+  /** 放弃时仍在排队的 turn 数 */
+  queueLength?: number;
+  reason?: string;
+}
+
 export interface ToolStartEvent extends TurnScoped {
   type: "tool.start";
   toolName: string;
@@ -114,6 +131,13 @@ export interface ToolBlockedEvent extends TurnScoped {
   toolName: string;
   toolCallId?: string;
   reason?: string;
+}
+
+export interface ToolTimeoutEvent extends TurnScoped {
+  type: "tool.timeout";
+  toolName: string;
+  toolCallId?: string;
+  timeoutMs: number;
 }
 
 export interface PluginErrorEvent {

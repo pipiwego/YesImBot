@@ -317,7 +317,9 @@ describe("ChannelRuntime response-idle compaction", () => {
     const archive = vi.spyOn(channel.conversation, "archiveIfOversize").mockResolvedValue(false);
     try {
       await value.post(event, { trigger: false });
-      expect(archive).toHaveBeenCalledWith(1, expect.objectContaining({ personaName: "Athena" }));
+      // R12：入站车道只做「有摘要就换会话」的廉价检查，不再把带 persona 的 CompactInput 传进来
+      // （那会在入站串行锁里跑一次无超时的 LLM 压缩）。没有摘要时由压缩车道处理。
+      expect(archive).toHaveBeenCalledWith(1, undefined, { requireSummary: true });
     } finally {
       await value.stop();
       await rm(root, { recursive: true, force: true });
