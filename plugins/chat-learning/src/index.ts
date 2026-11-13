@@ -34,8 +34,10 @@ import {
 import { createChatHistoryStore, type ChatHistoryStore } from "./history.js";
 import { buildLinks } from "./links.js";
 import { buildMemeTemplates, type MemePhraseInput } from "./memes.js";
+import { enrichSnapshotWithModel } from "./enrich.js";
 import { ModelCache } from "./model-cache.js";
-import { classifyPatternsWithModel, generateChainStyle, sampleSignature } from "./patterns.js";
+import { awaitRebuildForStep, DEFAULT_REBUILD_WAIT_MS } from "./rebuild-gate.js";
+import { classifyPatternsWithModelDetailed, generateChainStyle, sampleSignature } from "./patterns.js";
 import { detectProactiveEvent } from "./proactive.js";
 import { buildPromptBlock, escapePromptText, estimateTokens } from "./projector.js";
 import { createReflectionStore, hasReflectionForMessage, type ReflectionScore, type ReflectionStore } from "./reflection-store.js";
@@ -222,6 +224,7 @@ export default class ChatLearningPlugin {
     let lastGlobalSyncAt = 0;
     let dirty = true;
     let building: Promise<void> | undefined;
+    let buildingStartedAt: number | undefined;
     const channelScopeKey = `${scope.platform}:${scope.channelId}`;
     const isDirectScope = scope.type === "direct";
     let injectedTurn: string | undefined;
@@ -243,6 +246,8 @@ export default class ChatLearningPlugin {
 
     const rebuild = async (allowModel: boolean): Promise<void> => {
       if (building) return building;
+      // R15：记录在飞任务的起点，prepareStep 用它报告"已运行多久"。
+      const startedAt = Date.now();
       const task = (async () => {
         if (!runtimeStorage) return;
         const historyAgeMs = config.maxHistoryAgeDays * 24 * 60 * 60 * 1000;
@@ -262,9 +267,18 @@ export default class ChatLearningPlugin {
           });
           const refreshMs = config.refreshIntervalMinutes * 60 * 1000;
           const shouldEnrich = allowModel && resolveChatLearningModelId(this.ctx, config) !== undefined && Date.now() - lastModelEnrichAt >= refreshMs;
+          const enrichModelId = shouldEnrich ? resolveChatLearningModelId(this.ctx, config) : undefined;
+          const enrichModel = enrichModelId ? this.ctx.yesimbot.model.resolveChatModel(enrichModelId).model : undefined;
           let current = next;
           if (shouldEnrich) {
-            current = await enrichWithModel(next, config, this.ctx, logger, this.modelCache);
+            // R15：把"上一次学到的规律"作为基线传进去，空标注才不会把 patterns 清零。
+            current = await enrichSnapshotWithModel(next, state, {
+              model: enrichModel,
+              config,
+              logger,
+              cache: this.modelCache,
+              modelId: enrichModelId,
+            });
             lastModelEnrichAt = Date.now();
           } else if (state) {
             const fallbackMemeTemplates = await buildMemeTemplates(undefined, buildFallbackPhrases(next.turns));
@@ -336,8 +350,10 @@ export default class ChatLearningPlugin {
         }
       })().finally(() => {
         building = undefined;
+        buildingStartedAt = undefined;
       });
       building = task;
+      buildingStartedAt = startedAt;
       return task;
     };
 
@@ -463,7 +479,48 @@ export default class ChatLearningPlugin {
         }
         injectedTurn = context.turnId;
         cachedTurnReference = undefined;
-        if (dirty) await rebuild(false);
+        if (dirty) {
+          // R15：rebuild 是单飞的，可能正在跑 syncHooks 发起的带模型标注的那一轮（10–40s）。
+          // 这里绝不 await 它：有缓存就用缓存，无缓存最多等 2s，超时用空块继续。
+          const gateStartedAt = Date.now();
+          const inflight = building;
+          try {
+            const gate = await awaitRebuildForStep({
+              hasCache: state !== undefined,
+              inflight,
+              inflightStartedAt: buildingStartedAt,
+              startLocal: inflight ? undefined : () => rebuild(false),
+            });
+            if (gate.reason) {
+              logger.debug("chat_learning.prepare_step.rebuild_skipped", {
+                scope,
+                turnId: context.turnId,
+                reason: gate.reason,
+                runningMs: gate.runningMs,
+                waitedMs: gate.waitedMs,
+                hasCache: state !== undefined,
+                timeoutMs: DEFAULT_REBUILD_WAIT_MS,
+              });
+            }
+            if (gate.timedOut) {
+              logger.debug("chat_learning.prepare_step.rebuild_wait_timeout", {
+                scope,
+                turnId: context.turnId,
+                reason: gate.reason,
+                waitedMs: gate.waitedMs,
+                elapsedMs: Date.now() - gateStartedAt,
+                fallback: state !== undefined ? "cached_snapshot" : "empty_block",
+              });
+            }
+          } catch (cause) {
+            // 重建失败也要继续回复：宁可少注入一段风格块。
+            logger.warn("chat_learning.prepare_step.rebuild_failed", {
+              scope,
+              turnId: context.turnId,
+              cause: cause instanceof Error ? cause.message : String(cause),
+            });
+          }
+        }
         const eventKind = currentEvent;
         currentEvent = undefined;
         const bank = this.globalBanks.get(globalPath) ?? globalStore.read();
@@ -489,6 +546,11 @@ export default class ChatLearningPlugin {
           eventKind,
           stateTurns: state?.turns.length ?? 0,
           stateLinks: state?.links.length ?? 0,
+          // R15：运维要能直接看到"这个频道到底读到几条边界/规律"，否则 key 对不上永远是无头案。
+          boundaries: globalBoundaries.length,
+          boundaryKey: boundaryChannelKey(scopeKey(scope)),
+          globalPatterns: globalPatterns.length,
+          globalChains: globalChains.length,
           blockLength: block?.length ?? 0,
         });
         const reflectionBlock = buildReflectionHistory(reflectionStore, config.maxInjectedReflections);
@@ -971,8 +1033,8 @@ export default class ChatLearningPlugin {
       const segments = segmentTurns(turns);
       const links = buildLinks(turns);
       const modelId = resolveChatLearningModelId(this.ctx, config);
-      const patterns = modelId
-        ? await classifyPatternsWithModel(
+      const outcome = modelId
+        ? await classifyPatternsWithModelDetailed(
             this.ctx.yesimbot.model.resolveChatModel(modelId).model,
             turns,
             segments,
@@ -984,8 +1046,18 @@ export default class ChatLearningPlugin {
             return undefined;
           })
         : undefined;
-      const responsePatterns = patterns?.responsePatterns ?? [];
-      const initiationPatterns = patterns?.initiationPatterns ?? [];
+      // R15：合并是增量的（mergeLocalPatterns 只加不删），空结果不会清掉库里已有的规律，
+      // 但仍要留痕，避免"长期 0 条"再次变成无头案。
+      if (outcome && outcome.status !== "ok") {
+        this.logger.info("chat_learning.global_classify_empty", {
+          scopeKey: scopeKeyValue,
+          status: outcome.status,
+          reason: outcome.reason,
+          turns: turns.length,
+        });
+      }
+      const responsePatterns = outcome?.status === "ok" ? outcome.snapshot.responsePatterns : [];
+      const initiationPatterns = outcome?.status === "ok" ? outcome.snapshot.initiationPatterns : [];
       const chainPatterns = await enrichChainStyles(
         this.ctx,
         config,
@@ -1061,42 +1133,6 @@ function buildFallbackPhrases(turns: ChatLearningState["turns"]): MemePhraseInpu
     counts.set(phrase, (counts.get(phrase) ?? 0) + 1);
   }
   return [...counts.entries()].map(([phrase, frequency]) => ({ phrase, frequency }));
-}
-
-async function enrichWithModel(
-  state: ChatLearningState,
-  config: ChatLearningConfig,
-  ctx: Context,
-  logger: Logger,
-  cache?: ModelCache,
-): Promise<ChatLearningState> {
-  const modelId = resolveChatLearningModelId(ctx, config);
-  if (!modelId) return state;
-  try {
-    const ref = ctx.yesimbot.model.resolveChatModel(modelId);
-    const patterns = await classifyPatternsWithModel(
-      ref.model,
-      state.turns,
-      state.segments,
-      state.links,
-      { maxThreads: config.maxModelThreads, maxThreadMessages: config.maxModelThreadMessages },
-      cache,
-    );
-    if (!patterns) return state;
-    const memeTemplates = await buildMemeTemplates(
-      ref.model,
-      [
-        ...patterns.responsePatterns.map((pattern) => ({ phrase: pattern.phrase, frequency: pattern.frequency })),
-        ...patterns.initiationPatterns.map((pattern) => ({ phrase: pattern.phrase, frequency: pattern.frequency })),
-      ],
-      Date.now(),
-      cache,
-    );
-    return { ...state, responsePatterns: patterns.responsePatterns, initiationPatterns: patterns.initiationPatterns, memeTemplates, builtAt: Date.now() };
-  } catch (cause) {
-    logger.warn("chat_learning.model_enrich_failed", { model: modelId, cause: cause instanceof Error ? cause.message : String(cause) });
-    return state;
-  }
 }
 
 async function enrichChainStyles(

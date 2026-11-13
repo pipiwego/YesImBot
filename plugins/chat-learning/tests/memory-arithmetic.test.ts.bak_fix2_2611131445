@@ -1,0 +1,377 @@
+import { describe, expect, it } from "vitest";
+
+import { createEmptyGlobalRuleBank, kindsOf, mergeLocalPatterns, normalizeGlobalRuleBank, selectBoundaries, selectGlobalPatterns } from "../src/global-store.js";
+import { buildPromptBlock } from "../src/projector.js";
+import { computeSalience, detectBoundary, explainSalience } from "../src/salience.js";
+import type {
+  BoundaryMemory,
+  ChatLearningConfig,
+  ChatLearningState,
+  GlobalPattern,
+  GlobalRuleBank,
+  InitiationPattern,
+  MessageTurn,
+  ResponsePattern,
+} from "../src/types.js";
+
+const config: ChatLearningConfig = {
+  maxExamples: 2,
+  maxMessagesPerExample: 3,
+  maxHistoryAgeDays: 30,
+  maxScanMessages: 1000,
+  refreshIntervalMinutes: 30,
+  maxPromptTokens: 2500,
+  maskNames: true,
+  blockedUserIds: [],
+  blockedUserPatterns: [],
+  autoBlockBotNames: false,
+  ignoreBotMentions: true,
+  observeAllChannels: false,
+  globalRulePath: undefined,
+  globalSyncIntervalMinutes: 60,
+  minGlobalChannels: 2,
+  maxGlobalPatterns: 3,
+  summaryModel: undefined,
+  embeddingModel: undefined,
+  embeddingSimilarity: 0.92,
+  clusterSimilarity: 0.85,
+  maxModelThreads: 3,
+  maxModelThreadMessages: 30,
+  reflectionModel: undefined,
+  maxInjectedReflections: 3,
+  injectStyleAsSystem: false,
+};
+
+/** 构造与目标向量余弦恰为 cos 的单位向量。 */
+function unitVector(cos: number): readonly number[] {
+  return [cos, Math.sqrt(Math.max(0, 1 - cos * cos))];
+}
+
+function bankWithPattern(phrase: string, embedding: readonly number[], channelKey = "old"): GlobalRuleBank {
+  const pattern: GlobalPattern = {
+    kind: "response",
+    intent: "agree",
+    phrase,
+    channels: [{ key: channelKey, frequency: 1, lastSeenAt: 1 }],
+    firstSeenAt: 1,
+    lastSeenAt: 1,
+    embedding: [...embedding],
+  };
+  return { version: 1, updatedAt: 1, patterns: [pattern], chains: [], templates: [], boundaries: [] };
+}
+
+function turn(id: string, timestamp: number, text: string, userId = "u1", userName = "Alice"): MessageTurn {
+  return {
+    id,
+    messageId: id,
+    userId,
+    userName,
+    timestamp,
+    text,
+    elementKinds: ["text"],
+    hasImage: false,
+    quoteId: undefined,
+    quoteType: undefined,
+    mentionIds: [],
+  };
+}
+
+function state(): ChatLearningState {
+  const historical = [turn("h1", 100, "历史消息"), turn("h2", 200, "历史回应", "u2", "Bob")];
+  const current = [turn("t1", 1000, "这个方案靠谱吗"), turn("t2", 2000, "确实", "u2", "Bob")];
+  return {
+    lastEntryId: "t2",
+    builtAt: 3000,
+    turns: [...historical, ...current],
+    links: [],
+    segments: [
+      { id: "s0", startTime: 100, endTime: 200, turns: historical },
+      { id: "s1", startTime: 1000, endTime: 2000, turns: current },
+    ],
+    responsePatterns: [{ intent: "agree", phrase: "确实", frequency: 1, sampleIds: ["t2"] }],
+    initiationPatterns: [{ intent: "question", phrase: "有人试过吗", frequency: 1, sampleIds: ["t1"] }],
+    memeTemplates: [],
+  };
+}
+
+const boundary: BoundaryMemory = {
+  id: "b1",
+  text: "别在我面前提我妈",
+  channelKey: "chan-a",
+  firstSeenAt: 1,
+  lastSeenAt: 2,
+  strength: 0.72,
+  hits: 1,
+};
+
+describe("§5.1 去重跨 kind", () => {
+  it("同 phrase 先 response 再 initiation 只留 1 行，channels 不翻倍", () => {
+    const response: ResponsePattern = { intent: "joke", phrase: "定了也可以，跟我结婚吧", frequency: 1, sampleIds: ["a"] };
+    const initiation: InitiationPattern = { intent: "react", phrase: "定了也可以，跟我结婚吧", frequency: 1, sampleIds: ["a"] };
+
+    const first = mergeLocalPatterns(createEmptyGlobalRuleBank(), [response], [], [], "channel-a", 1000);
+    const second = mergeLocalPatterns(first, [], [initiation], [], "channel-a", 2000);
+
+    expect(second.patterns).toHaveLength(1);
+    const pattern = second.patterns[0]!;
+    expect(pattern.kinds).toEqual(["response", "initiation"]);
+    expect(pattern.intents).toEqual(["joke", "react"]);
+    // 老字段保留为首值，兼容老读者
+    expect(pattern.kind).toBe("response");
+    expect(pattern.intent).toBe("joke");
+    expect(pattern.channels).toHaveLength(1);
+    expect(pattern.channels[0]!.frequency).toBe(1);
+    expect(selectGlobalPatterns(second, "response", 1, 8)).toHaveLength(1);
+    expect(selectGlobalPatterns(second, "initiation", 1, 8)).toHaveLength(1);
+  });
+
+  it("加载时按 phrase 迁移合并线上老数据（含同频道两条）", () => {
+    const migrated = normalizeGlobalRuleBank({
+      version: 1,
+      updatedAt: 1,
+      patterns: [
+        {
+          kind: "initiation",
+          intent: "react",
+          phrase: "定了也可以，跟我结婚吧",
+          channels: [{ key: "chan-a", frequency: 1, lastSeenAt: 20 }],
+          firstSeenAt: 5,
+          lastSeenAt: 20,
+        },
+        {
+          kind: "response",
+          intent: "joke",
+          phrase: "定了也可以，跟我结婚吧",
+          channels: [{ key: "chan-a", frequency: 1, lastSeenAt: 10 }],
+          firstSeenAt: 1,
+          lastSeenAt: 10,
+        },
+      ],
+      chains: [],
+      templates: [],
+    });
+
+    expect(migrated.patterns).toHaveLength(1);
+    const pattern = migrated.patterns[0]!;
+    expect(pattern.kinds).toBeDefined();
+    expect(pattern.intents).toBeDefined();
+    expect(typeof pattern.salience).toBe("number");
+    expect(pattern.kinds).toEqual(expect.arrayContaining(["response", "initiation"]));
+    expect(pattern.intents).toEqual(expect.arrayContaining(["joke", "react"]));
+    expect(pattern.channels).toHaveLength(1);
+    expect(pattern.firstSeenAt).toBe(1);
+    expect(pattern.lastSeenAt).toBe(20);
+    expect(migrated.boundaries).toEqual([]);
+
+    // 迁移对已合并数据幂等
+    const again = normalizeGlobalRuleBank(migrated);
+    expect(again.patterns).toHaveLength(1);
+    expect(again.patterns[0]!.kinds).toEqual(pattern.kinds);
+  });
+});
+
+describe("§5.2 跨 intent 的余弦合并", () => {
+  const response: ResponsePattern = { intent: "agree", phrase: "确实", frequency: 1, sampleIds: ["m2"] };
+
+  function mergeAt(cos: number) {
+    return mergeLocalPatterns(bankWithPattern("没错", unitVector(1)), [response], [], [], "channel-new", 2, {
+      localEmbeddings: new Map([["response:agree:确实", unitVector(cos)]]),
+      embeddingSimilarity: 0.92,
+      clusterSimilarity: 0.85,
+    });
+  }
+
+  it("余弦 0.95 → merge 档，1 行且不记 variants", () => {
+    const merged = mergeAt(0.95);
+    expect(merged.patterns).toHaveLength(1);
+    expect(merged.patterns[0]!.phrase).toBe("没错");
+    expect(merged.patterns[0]!.variants).toBeUndefined();
+    expect(merged.patterns[0]!.channels).toHaveLength(2);
+  });
+
+  it("余弦 0.88 → cluster 档，1 行 + variants 记录措辞", () => {
+    const merged = mergeAt(0.88);
+    expect(merged.patterns).toHaveLength(1);
+    expect(merged.patterns[0]!.phrase).toBe("没错");
+    expect(merged.patterns[0]!.variants).toEqual(["确实"]);
+  });
+
+  it("余弦 0.70 → 2 行", () => {
+    const merged = mergeAt(0.7);
+    expect(merged.patterns).toHaveLength(2);
+  });
+
+  it("variants 最多 4 条", () => {
+    let bank: GlobalRuleBank = bankWithPattern("没错", unitVector(1));
+    for (const phrase of ["确实", "是的", "对的", "嗯嗯", "就是这样"]) {
+      bank = mergeLocalPatterns(bank, [{ intent: "agree", phrase, frequency: 1, sampleIds: [] }], [], [], "channel-new", 2, {
+        localEmbeddings: new Map([["response:agree:" + phrase, unitVector(0.88)]]),
+        embeddingSimilarity: 0.92,
+        clusterSimilarity: 0.85,
+      });
+    }
+    expect(bank.patterns).toHaveLength(1);
+    expect(bank.patterns[0]!.variants!.length).toBeLessThanOrEqual(4);
+  });
+});
+
+describe("§5.3 阈值边界值", () => {
+  const response: ResponsePattern = { intent: "agree", phrase: "确实", frequency: 1, sampleIds: [] };
+
+  function mergeAt(cos: number, mergeThreshold = 0.92, clusterThreshold = 0.85) {
+    return mergeLocalPatterns(bankWithPattern("没错", unitVector(1)), [response], [], [], "channel-new", 2, {
+      localEmbeddings: new Map([["response:agree:确实", unitVector(cos)]]),
+      embeddingSimilarity: mergeThreshold,
+      clusterSimilarity: clusterThreshold,
+    });
+  }
+
+  it("0.9199 不进 merge 档（落到 cluster 档）", () => {
+    const merged = mergeAt(0.9199);
+    expect(merged.patterns).toHaveLength(1);
+    expect(merged.patterns[0]!.variants).toEqual(["确实"]);
+  });
+
+  it("0.9201 进 merge 档", () => {
+    const merged = mergeAt(0.9201);
+    expect(merged.patterns).toHaveLength(1);
+    expect(merged.patterns[0]!.variants).toBeUndefined();
+  });
+
+  it("cluster 阈值不低于 merge 阈值时不做 cluster 归并", () => {
+    const merged = mergeAt(0.9199, 0.92, 0.92);
+    expect(merged.patterns).toHaveLength(2);
+  });
+
+  it("embeddingSimilarity=1 视为关闭语义归并", () => {
+    const merged = mergeAt(0.99, 1, 0.85);
+    expect(merged.patterns).toHaveLength(2);
+  });
+});
+
+describe("§5.4 边界被特殊对待", () => {
+  it("判定：典型边界命中，日常闲聊不命中", () => {
+    const hit = detectBoundary("别在我面前提我妈");
+    expect(hit.hit).toBe(true);
+    expect(hit.imperative).toBeGreaterThanOrEqual(0.55);
+    expect(hit.persistence).toBeGreaterThanOrEqual(0.5);
+    expect(hit.score).toBeGreaterThan(0.5);
+
+    expect(detectBoundary("今天吃了拉面").hit).toBe(false);
+    expect(detectBoundary("这个方案靠谱吗").hit).toBe(false);
+  });
+
+  it("不受 minGlobalChannels 约束：单频道也选中", () => {
+    const bank = mergeLocalPatterns(
+      createEmptyGlobalRuleBank(),
+      [{ intent: "agree", phrase: "确实", frequency: 1, sampleIds: [] }],
+      [],
+      [],
+      "chan-a",
+      1000,
+      { boundaryTexts: ["别再跟我说这个"] },
+    );
+
+    expect(selectGlobalPatterns(bank, "response", 2, 8)).toHaveLength(0);
+    expect(selectBoundaries(bank)).toHaveLength(1);
+    expect(selectBoundaries(bank)[0]!.text).toBe("别再跟我说这个");
+  });
+
+  it("max 聚合：重复出现不提升 strength，hits 只用于观测", () => {
+    const first = mergeLocalPatterns(createEmptyGlobalRuleBank(), [], [], [], "chan-a", 1000, { boundaryTexts: ["别在我面前提我妈"] });
+    expect(first.boundaries).toHaveLength(1);
+    const strength = first.boundaries![0]!.strength;
+
+    const second = mergeLocalPatterns(first, [], [], [], "chan-b", 2000, { boundaryTexts: ["别在我面前提我妈", "今天吃了拉面"] });
+
+    expect(second.boundaries).toHaveLength(1);
+    expect(second.boundaries![0]!.strength).toBe(strength);
+    expect(second.boundaries![0]!.hits).toBe(2);
+    expect(second.boundaries![0]!.channelKey).toBe(first.boundaries![0]!.channelKey);
+    expect(second.boundaries![0]!.lastSeenAt).toBe(2000);
+  });
+
+  it("revokedAt 后不再返回、也不再注入", () => {
+    const bank = mergeLocalPatterns(createEmptyGlobalRuleBank(), [], [], [], "chan-a", 1000, { boundaryTexts: ["别在我面前提我妈"] });
+    const revoked: GlobalRuleBank = { ...bank, boundaries: bank.boundaries!.map((item) => ({ ...item, revokedAt: 3000 })) };
+
+    expect(selectBoundaries(revoked)).toHaveLength(0);
+    const block = buildPromptBlock(undefined, undefined, config, [], [], [], [], revoked.boundaries);
+    expect(block ?? "").not.toContain("<boundaries>");
+  });
+
+  it("注入位置在 guide 之后、样本之前，且全量列出", () => {
+    const block = buildPromptBlock(state(), undefined, config, [], [], [], [], [boundary, { ...boundary, id: "b2", text: "别再跟我说这个" }]);
+
+    expect(block).toBeDefined();
+    const text = block!;
+    expect(text).toContain("<boundaries>");
+    expect(text).toContain("别在我面前提我妈");
+    expect(text).toContain("别再跟我说这个");
+    expect(text.indexOf("<chat_learning_guide>")).toBeLessThan(text.indexOf("<boundaries>"));
+    expect(text.indexOf("<boundaries>")).toBeLessThan(text.indexOf("<style_examples historical"));
+    // 不展示命中次数，避免「反复重申的边界」被放大
+    expect(text).not.toContain("hits=");
+  });
+
+  it("只有边界时也能单独成块", () => {
+    const block = buildPromptBlock(undefined, undefined, config, [], [], [], [], [boundary]);
+    expect(block).toContain("<boundaries>");
+    expect(block).toContain("别在我面前提我妈");
+  });
+});
+
+describe("§5.5 salience", () => {
+  it("总是落在 [0,1]", () => {
+    for (const text of ["别在我面前提我妈！我受不了了", "今天吃了拉面", "", "??", "a".repeat(200)]) {
+      const value = computeSalience(text);
+      expect(value).toBeGreaterThanOrEqual(0);
+      expect(value).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("同文本第二次出现（novelty 下降）salience 不升", () => {
+    const text = "定了也可以，跟我结婚吧";
+    const first = computeSalience(text, { maxCosine: 0.5 });
+    const second = computeSalience(text, { maxCosine: 0.95 });
+    expect(second).toBeLessThan(first);
+  });
+
+  it("高 cue 文本 > 低 cue 文本", () => {
+    const high = computeSalience("别在我面前提我妈！我真的受不了了！！！");
+    const low = computeSalience("今天吃了拉面");
+    expect(high).toBeGreaterThan(low);
+  });
+
+  it("无历史时 novelty 取中性 0.5（不奖不罚）", () => {
+    expect(explainSalience("今天吃了拉面").novelty).toBe(0.5);
+    expect(explainSalience("今天吃了拉面", { maxCosine: 0.92 }).novelty).toBe(0);
+    // 同一输入重复计算完全一致（纯算术，可回归）
+    expect(computeSalience("今天吃了拉面")).toBe(computeSalience("今天吃了拉面"));
+  });
+
+  it("写入后 salience 固定，重复合并不被抬高，hits 递增", () => {
+    const response: ResponsePattern = { intent: "agree", phrase: "确实", frequency: 1, sampleIds: [] };
+    const first = mergeLocalPatterns(createEmptyGlobalRuleBank(), [response], [], [], "chan-a", 1000);
+    const salience = first.patterns[0]!.salience;
+    expect(typeof salience).toBe("number");
+
+    const second = mergeLocalPatterns(first, [response], [], [], "chan-a", 2000);
+    expect(second.patterns[0]!.salience).toBe(salience);
+    expect(second.patterns[0]!.hits).toBe(2);
+  });
+
+  it("老数据无 salience 时 kindsOf 兜底、排序倍率仍为 1.0", () => {
+    const legacy = normalizeGlobalRuleBank({
+      version: 1,
+      updatedAt: 1,
+      patterns: [{ kind: "response", intent: "agree", phrase: "确实", channels: [{ key: "a", frequency: 2, lastSeenAt: 1 }], firstSeenAt: 1, lastSeenAt: 1 }],
+      chains: [],
+      templates: [],
+    });
+    expect(kindsOf(legacy.patterns[0]!)).toEqual(["response"]);
+    // 有 salience 的同一 pattern 排序分只会更高或相等
+    const withSalience: GlobalPattern = { ...legacy.patterns[0]!, salience: 1 };
+    expect(selectGlobalPatterns({ ...legacy, patterns: [withSalience] }, "response", 1, 8)).toHaveLength(1);
+  });
+});

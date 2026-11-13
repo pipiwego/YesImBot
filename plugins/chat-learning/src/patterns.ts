@@ -37,24 +37,37 @@ export interface ClassifyModelOptions {
   readonly maxThreadMessages?: number;
 }
 
+/**
+ * 标注结果的三种语义（R15）：
+ * - ok     ：成功拿到结果，可能为空数组（模型确实认为没有可学规律）；
+ * - empty  ：成功但输入侧没有可标注的东西（没有线程 / 全部 noise 之外的无效标签）；
+ * - failed ：上游报错或输出无法解析。
+ * 只有 ok 才允许覆盖已有规律；empty/failed 一律保留旧值，只是日志级别不同。
+ */
+export type PatternAnnotationOutcome =
+  | { readonly status: "ok"; readonly snapshot: PatternSnapshot }
+  | { readonly status: "empty"; readonly reason: "no_threads" }
+  | { readonly status: "failed"; readonly reason: "model_error" | "parse_error"; readonly detail: string };
+
 interface ClassifyThread {
   readonly turns: readonly MessageTurn[];
 }
 
-export async function classifyPatternsWithModel(
+/** 详细版：保留失败/空结果的区别，供调用方决定是否覆盖已有规律。失败结果不进缓存。 */
+export async function classifyPatternsWithModelDetailed(
   model: LanguageModel,
   turns: readonly MessageTurn[],
   segments: readonly ConversationSegment[],
   links: readonly MessageLink[] = [],
   options: ClassifyModelOptions = {},
   cache?: ModelCache,
-): Promise<PatternSnapshot | undefined> {
+): Promise<PatternAnnotationOutcome> {
   const key = cache?.key(["classify", modelCacheId(model), turns, segments, links, options]);
-  const produce = async (): Promise<PatternSnapshot | undefined> => {
+  const produce = async (): Promise<PatternAnnotationOutcome> => {
     const maxThreads = options.maxThreads ?? 3;
     const maxThreadMessages = options.maxThreadMessages ?? 30;
     const threads = selectClassifyThreads(segments, links, maxThreads, maxThreadMessages);
-    if (threads.length === 0) return undefined;
+    if (threads.length === 0) return { status: "empty", reason: "no_threads" };
 
     const { prompt, messageByPromptId } = buildThreadPrompt(threads);
     const system = [
@@ -72,11 +85,96 @@ export async function classifyPatternsWithModel(
     try {
       const { text } = await generateText({ model, system, prompt, temperature: 0.1 });
       return parseModelAnnotations(text, messageByPromptId);
-    } catch {
-      return undefined;
+    } catch (cause) {
+      return { status: "failed", reason: "model_error", detail: cause instanceof Error ? cause.message : String(cause) };
     }
   };
-  return cache && key ? cache.getOrProduce(key, produce) : produce();
+  if (!cache || !key) return produce();
+  const cached = cache.get<PatternAnnotationOutcome>(key);
+  if (cached !== undefined) return cached;
+  const outcome = await produce();
+  // 只缓存成功结果：失败/空结果缓存住会让上游一次抖动长期失效。
+  if (outcome.status === "ok") cache.set(key, outcome);
+  return outcome;
+}
+
+/** 兼容旧接口：只要快照，失败与"无输入"都压成 undefined。 */
+export async function classifyPatternsWithModel(
+  model: LanguageModel,
+  turns: readonly MessageTurn[],
+  segments: readonly ConversationSegment[],
+  links: readonly MessageLink[] = [],
+  options: ClassifyModelOptions = {},
+  cache?: ModelCache,
+): Promise<PatternSnapshot | undefined> {
+  const outcome = await classifyPatternsWithModelDetailed(model, turns, segments, links, options, cache);
+  return outcome.status === "ok" ? outcome.snapshot : undefined;
+}
+
+export interface AnnotationBaseline {
+  readonly responsePatterns: readonly ResponsePattern[];
+  readonly initiationPatterns: readonly InitiationPattern[];
+}
+
+export type AnnotationApplyReason = "replaced" | "partial_empty" | "empty_annotation" | "no_threads" | "model_error" | "parse_error";
+
+export interface AppliedAnnotation extends PatternSnapshot {
+  /** true = 至少一个字段采用了新结果。 */
+  readonly applied: boolean;
+  /** 需要记日志的级别；undefined 表示正常替换、无需额外日志。 */
+  readonly level: "info" | "warn" | undefined;
+  readonly reason: AnnotationApplyReason;
+  /** 保留的旧值条数。 */
+  readonly keptResponse: number;
+  readonly keptInitiation: number;
+  /** 新结果的条数。 */
+  readonly newResponse: number;
+  readonly newInitiation: number;
+}
+
+/**
+ * 把标注结果合到已有规律上（R15 缺陷 2 的修复点）。
+ *
+ * 规则：新结果为空数组就保留旧的对应字段。一次空标注（上游空响应、解析失败、
+ * 或者模型确实把整段判成 noise）不允许把学到的规律整段清零。
+ * 返回的 level 交给调用方记日志：失败 → warn，真空 → info。
+ */
+export function applyPatternAnnotations(baseline: AnnotationBaseline, outcome: PatternAnnotationOutcome): AppliedAnnotation {
+  const keptAll: AppliedAnnotation = {
+    responsePatterns: baseline.responsePatterns,
+    initiationPatterns: baseline.initiationPatterns,
+    applied: false,
+    level: outcome.status === "failed" ? "warn" : "info",
+    reason: outcome.status === "failed" ? outcome.reason : "no_threads",
+    keptResponse: baseline.responsePatterns.length,
+    keptInitiation: baseline.initiationPatterns.length,
+    newResponse: 0,
+    newInitiation: 0,
+  };
+  if (outcome.status !== "ok") return keptAll;
+
+  const newResponse = outcome.snapshot.responsePatterns;
+  const newInitiation = outcome.snapshot.initiationPatterns;
+  const keepResponse = newResponse.length === 0 && baseline.responsePatterns.length > 0;
+  const keepInitiation = newInitiation.length === 0 && baseline.initiationPatterns.length > 0;
+
+  if (newResponse.length === 0 && newInitiation.length === 0) {
+    return { ...keptAll, level: "info", reason: "empty_annotation" };
+  }
+  if (keepResponse && keepInitiation) {
+    return { ...keptAll, level: "info", reason: "empty_annotation" };
+  }
+  return {
+    responsePatterns: keepResponse ? baseline.responsePatterns : newResponse,
+    initiationPatterns: keepInitiation ? baseline.initiationPatterns : newInitiation,
+    applied: true,
+    level: keepResponse || keepInitiation ? "info" : undefined,
+    reason: keepResponse || keepInitiation ? "partial_empty" : "replaced",
+    keptResponse: keepResponse ? baseline.responsePatterns.length : 0,
+    keptInitiation: keepInitiation ? baseline.initiationPatterns.length : 0,
+    newResponse: newResponse.length,
+    newInitiation: newInitiation.length,
+  };
 }
 
 export async function generateChainStyle(
@@ -186,23 +284,24 @@ function byFrequency(left: { readonly frequency: number }, right: { readonly fre
   return right.frequency - left.frequency;
 }
 
-function parseModelAnnotations(text: string, messageByPromptId: ReadonlyMap<string, MessageTurn>): PatternSnapshot | undefined {
+function parseModelAnnotations(text: string, messageByPromptId: ReadonlyMap<string, MessageTurn>): PatternAnnotationOutcome {
   const cleaned = text
     .trim()
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/, "")
     .trim();
+  if (cleaned.length === 0) return { status: "failed", reason: "parse_error", detail: "empty response" };
   let parsed: unknown;
   try {
     parsed = JSON.parse(cleaned);
-  } catch {
-    return undefined;
+  } catch (cause) {
+    return { status: "failed", reason: "parse_error", detail: cause instanceof Error ? cause.message : String(cause) };
   }
-  if (typeof parsed !== "object" || parsed === null) return undefined;
-  if (!("messages" in parsed)) return undefined;
+  if (typeof parsed !== "object" || parsed === null) return { status: "failed", reason: "parse_error", detail: "not an object" };
+  if (!("messages" in parsed)) return { status: "failed", reason: "parse_error", detail: "missing messages" };
 
   const result = modelOutputSchema.safeParse(parsed);
-  if (!result.success) return undefined;
+  if (!result.success) return { status: "failed", reason: "parse_error", detail: result.error.issues[0]?.message ?? "schema mismatch" };
 
   const responseCounts = new Map<string, { intent: ResponseIntent; phrase: string; sampleIds: string[] }>();
   const initiationCounts = new Map<string, { intent: InitiationIntent; phrase: string; sampleIds: string[] }>();
@@ -231,12 +330,15 @@ function parseModelAnnotations(text: string, messageByPromptId: ReadonlyMap<stri
   }
 
   return {
-    responsePatterns: [...responseCounts.values()]
-      .map((item) => ({ intent: item.intent, phrase: item.phrase, frequency: item.sampleIds.length, sampleIds: item.sampleIds.slice(0, 3) }))
-      .sort(byFrequency),
-    initiationPatterns: [...initiationCounts.values()]
-      .map((item) => ({ intent: item.intent, phrase: item.phrase, frequency: item.sampleIds.length, sampleIds: item.sampleIds.slice(0, 3) }))
-      .sort(byFrequency),
+    status: "ok",
+    snapshot: {
+      responsePatterns: [...responseCounts.values()]
+        .map((item) => ({ intent: item.intent, phrase: item.phrase, frequency: item.sampleIds.length, sampleIds: item.sampleIds.slice(0, 3) }))
+        .sort(byFrequency),
+      initiationPatterns: [...initiationCounts.values()]
+        .map((item) => ({ intent: item.intent, phrase: item.phrase, frequency: item.sampleIds.length, sampleIds: item.sampleIds.slice(0, 3) }))
+        .sort(byFrequency),
+    },
   };
 }
 

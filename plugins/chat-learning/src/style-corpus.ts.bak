@@ -1,0 +1,1053 @@
+import { existsSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
+import { getSharedBgeEmbedder } from "./bge-embedder.js";
+import { observeReply, spiceHint, type TurnCtx } from "./spice-gate.js";
+
+export interface StyleCorpusConfig {
+  dbPath?: string;
+  enabled?: boolean;
+}
+
+export interface RetrieveOptions {
+  scopeKey?: string;
+  isPrivate?: boolean;
+  isMaster?: boolean;
+  safety?: 0 | 1 | 2 | 3;
+  hour?: number;
+  mood?: number;
+  lastBotReply?: string;
+  hasMedia?: boolean;
+  llmSceneGate?: "work_delivery" | "comfort" | "casual";
+  llmInMove?: string;
+}
+
+export interface StrippedMediaResult {
+  readonly text: string;
+  readonly hasMedia: boolean;
+  readonly hasFile: boolean;
+}
+
+export interface SemanticClassification {
+  readonly sceneGate: "work_delivery" | "comfort" | "casual";
+  readonly inMove: string;
+  readonly qVec: Float32Array | null;
+  readonly workSim: number;
+  readonly comfortSim: number;
+  readonly top1Sim: number;
+}
+
+interface StyleAnchorRow {
+  anchor_id: number;
+  source_bucket: string;
+  in_move: string;
+  out_move: string;
+  scene_gate: string;
+  stimulus_summary: string;
+  raw_reply: string;
+  skeleton_template: string;
+  domain_specificity: number;
+  topic_terms_json: string;
+  char_len: number;
+  line_count: number;
+  has_end_punct: number;
+  quality_score: number;
+  alpha_win?: number | null;
+  beta_loss?: number | null;
+  bm25_score?: number;
+}
+
+interface StyleDistributionRow {
+  in_move: string;
+  len_p25: number | null;
+  len_p50: number | null;
+  len_p75: number | null;
+  multi_line_prob: number | null;
+  no_period_prob: number | null;
+  non_literal_prob: number | null;
+}
+
+interface VectorCache {
+  ino: number;
+  mtimeMs: number;
+  dim: number;
+  count: number;
+  anchorIds: Int32Array;
+  matrix: Float32Array;
+  rowsById: Map<number, StyleAnchorRow>;
+  moveCounts: Map<string, number>;
+  moveCentroids: Map<string, Float32Array>;
+  comfortCentroid: Float32Array;
+  workCentroid: Float32Array;
+}
+
+const DEFAULT_DB_PATH = "/opt/shion/koishi-app/data/yesimbot/style-corpus/shion_style_corpus.db";
+const HOST_DB_FALLBACK = "/srv/appdata/shion-stack/koishi-data/yesimbot/style-corpus/shion_style_corpus.db";
+const MASTER_IDS = new Set(["2596464506", "private:2596464506"]);
+
+const WORK_CENTROID_PROMPTS = [
+  "帮我写一段Python脚本处理这个压缩包数据",
+  "排查一下这段报错代码并重构",
+  "把这个PDF转成Word表格导出",
+  "帮我实现一个TypeScript函数并编写单元测试",
+  "分析一下这个JSON配置文件并生成部署脚本",
+  "帮我写个正则表达式批量提取日志里的字段",
+] as const;
+
+const COMFORT_CENTROID_SEEDS = [
+  "今天去人事办了离职交了工牌，抱着纸箱在地铁站坐了很久心里空落落的",
+  "刚从医院出来，一个人坐在走廊长椅上发呆，感觉好孤单好委屈",
+  "努力准备了几个月的考试和面试全挂了，整个人一点力气都没有",
+  "和在一起很久的人彻底散了，回家的路上眼泪一直往下掉",
+] as const;
+
+const zhSegmenter =
+  typeof Intl !== "undefined" && typeof (Intl as any).Segmenter === "function"
+    ? new (Intl as any).Segmenter("zh-CN", { granularity: "word" })
+    : null;
+
+// 按频道隔离的 80 轮 RingBuffer 冷却锁
+class RingBuffer {
+  private buffer: number[] = [];
+  private set = new Set<number>();
+  constructor(private readonly capacity: number = 80) {}
+
+  add(id: number): void {
+    if (this.set.has(id)) return;
+    this.buffer.push(id);
+    this.set.add(id);
+    if (this.buffer.length > this.capacity) {
+      const removed = this.buffer.shift();
+      if (removed !== undefined) this.set.delete(removed);
+    }
+  }
+
+  has(id: number): boolean {
+    return this.set.has(id);
+  }
+}
+
+function getDatabaseSync(): any {
+  try {
+    const builtin = (process as any).getBuiltinModule?.("node:sqlite");
+    if (builtin?.DatabaseSync) return builtin.DatabaseSync;
+    const req = typeof require === "function" ? require : createRequire(import.meta.url);
+    const mod = req("node:sqlite");
+    return mod?.DatabaseSync ?? mod?.default?.DatabaseSync ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeFloatVec(vec: Float32Array): Float32Array {
+  const dim = vec.length;
+  let norm = 0;
+  for (let d = 0; d < dim; d++) {
+    const v = vec[d]!;
+    norm += v * v;
+  }
+  norm = Math.sqrt(norm) || 1e-12;
+  const out = new Float32Array(dim);
+  for (let d = 0; d < dim; d++) {
+    out[d] = vec[d]! / norm;
+  }
+  return out;
+}
+
+function dotVec(a: Float32Array, b: Float32Array): number {
+  const len = Math.min(a.length, b.length);
+  let sum = 0;
+  for (let i = 0; i < len; i++) {
+    sum += a[i]! * b[i]!;
+  }
+  return sum;
+}
+
+const MEDIA_PLACEHOLDER_RE = /\[(?:图片|表情|动画表情|语音|视频)(?:[：:][^\]]*)?\]|<img\b[^>]*>|<audio\b[^>]*>|<video\b[^>]*>|<sticker\b[^>]*>/gi;
+const FILE_PLACEHOLDER_RE = /\[文件(?:[：:][^\]]*)?\]|<file\b[^>]*>/gi;
+const MSG_HEADER_RE = /^\[time=[^\]]*\]\s*/i;
+
+/**
+ * 剥离消息头与媒体占位符（[图片：asset://...]、[表情：...]、[语音：...] 等），
+ * 保留是否包含图片/表情与是否包含文件标记，防止发图被误判为 work_delivery 或纯图往前翻旧消息串台。
+ */
+export function stripMediaPlaceholders(raw: string): StrippedMediaResult {
+  const withoutHeader = raw.replace(MSG_HEADER_RE, "");
+  MEDIA_PLACEHOLDER_RE.lastIndex = 0;
+  FILE_PLACEHOLDER_RE.lastIndex = 0;
+  const hasMedia = MEDIA_PLACEHOLDER_RE.test(withoutHeader);
+  const hasFile = FILE_PLACEHOLDER_RE.test(withoutHeader);
+  const text = withoutHeader
+    .replace(MEDIA_PLACEHOLDER_RE, " ")
+    .replace(FILE_PLACEHOLDER_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return { text, hasMedia, hasFile };
+}
+
+/**
+ * 使用 Node 22 原生 Intl.Segmenter("zh-CN", { granularity: "word" }) + 双字滑窗 (2-gram) 兜底分词
+ */
+export function segmentChineseTokens(rawText: string, maxTokens = 28): string[] {
+  if (!rawText) return [];
+  const tokens: string[] = [];
+  const seen = new Set<string>();
+  const add = (w: string) => {
+    const clean = w.toLowerCase().trim();
+    if (!clean || tokens.length >= maxTokens) return;
+    if (!seen.has(clean)) {
+      seen.add(clean);
+      tokens.push(clean);
+    }
+  };
+
+  if (zhSegmenter) {
+    try {
+      for (const seg of zhSegmenter.segment(rawText)) {
+        if (!seg.isWordLike) continue;
+        const word = String(seg.segment).trim();
+        if (/^[\p{Script=Han}]+$/u.test(word)) {
+          if (word.length >= 2 && word.length <= 6) {
+            add(word);
+          } else if (word.length > 6) {
+            const chars = Array.from(word);
+            for (let i = 0; i <= chars.length - 2; i += 2) {
+              add(chars.slice(i, i + 2).join(""));
+            }
+          }
+        } else if (/^[a-zA-Z0-9]{2,16}$/.test(word)) {
+          add(word);
+        }
+      }
+    } catch {
+      // fallback below
+    }
+  }
+
+  // 补充中文双字滑窗，防止新造词/人名/游戏缩写漏检
+  const hanRuns = rawText.match(/[\p{Script=Han}]{2,}/gu) ?? [];
+  for (const run of hanRuns) {
+    const chars = Array.from(run);
+    for (let i = 0; i <= chars.length - 2; i++) {
+      add(chars.slice(i, i + 2).join(""));
+    }
+  }
+  return tokens;
+}
+
+/**
+ * 构造针对 style_anchors_seg_fts (unicode61) 的安全分词 OR 查询
+ */
+export function buildSafeSegmentedFtsQuery(rawText: string, maxTokens = 24): string {
+  const tokens = segmentChineseTokens(rawText, maxTokens);
+  if (tokens.length === 0) return "";
+  return tokens.map((t) => `"${t}"`).join(" OR ");
+}
+
+/**
+ * 兼容旧版 trigram 查询构建函数（导出以保持向后兼容）
+ */
+export function buildSafeFtsTrigramQuery(rawText: string, maxGrams = 10): string {
+  const chunks = rawText.match(/[\p{Script=Han}a-zA-Z0-9]+/gu);
+  if (!chunks) return "";
+  const joined = chunks.join("");
+  const chars = Array.from(joined);
+  if (chars.length < 3) return "";
+  const seen = new Set<string>();
+  const grams: string[] = [];
+  for (let i = 0; i <= chars.length - 3 && grams.length < maxGrams; i++) {
+    const gram = chars.slice(i, i + 3).join("").toLowerCase();
+    if (!seen.has(gram)) {
+      seen.add(gram);
+      grams.push(`"${gram}"`);
+    }
+  }
+  return grams.join(" OR ");
+}
+
+/**
+ * 滑动 2~3 字词 + Intl.Segmenter 词元切分（用于精确计算 Jaccard 异话题排斥与黑话骨架切换）
+ */
+export function extractSlidingTerms(text: string): Set<string> {
+  const set = new Set<string>(segmentChineseTokens(text, 64));
+  const hanRuns = text.match(/[\p{Script=Han}]{2,}/gu) ?? [];
+  for (const run of hanRuns) {
+    const chars = Array.from(run);
+    if (chars.length <= 3) {
+      set.add(run);
+      continue;
+    }
+    for (let i = 0; i <= chars.length - 2; i++) {
+      set.add(chars.slice(i, i + 2).join(""));
+      if (i <= chars.length - 3) {
+        set.add(chars.slice(i, i + 3).join(""));
+      }
+    }
+  }
+  const alnumRuns = text.match(/[a-zA-Z0-9]{2,16}/g) ?? [];
+  for (const token of alnumRuns) {
+    set.add(token.toLowerCase());
+  }
+  return set;
+}
+
+export class StyleCorpusRetriever {
+  private customPath?: string;
+  private activePath = "";
+  private db: any = null;
+  private dbIno = -1;
+  private dbMtimeMs = -1;
+  private lastStatAt = 0;
+  private lastRetryAt = 0;
+  private stmtCache = new Map<string, any>();
+  private vecCache: VectorCache | null = null;
+  private cooldownByScope = new Map<string, RingBuffer>();
+  private lastReplyByScope = new Map<string, string>();
+
+  constructor(customPath?: string) {
+    this.customPath = customPath;
+  }
+
+  public closeDb(): void {
+    this.stmtCache.clear();
+    if (this.db) {
+      try {
+        this.db.close?.();
+      } catch {
+        // ignore close error
+      }
+      this.db = null;
+    }
+    this.dbIno = -1;
+    this.dbMtimeMs = -1;
+    this.vecCache = null;
+  }
+
+  private resolveTargetPath(): string | null {
+    if (this.customPath && existsSync(this.customPath)) return this.customPath;
+    if (existsSync(DEFAULT_DB_PATH)) return this.customPath || DEFAULT_DB_PATH;
+    if (existsSync(HOST_DB_FALLBACK)) return HOST_DB_FALLBACK;
+    return null;
+  }
+
+  private ensureDb(): any {
+    const now = Date.now();
+    if (this.db) {
+      if (now - this.lastStatAt < 3000) return this.db;
+      this.lastStatAt = now;
+      try {
+        const st = statSync(this.activePath);
+        if (st.ino === this.dbIno && st.mtimeMs === this.dbMtimeMs) {
+          return this.db;
+        }
+        this.closeDb();
+      } catch {
+        this.closeDb();
+      }
+    }
+
+    if (now - this.lastRetryAt < 1000) return null;
+    this.lastRetryAt = now;
+
+    const targetPath = this.resolveTargetPath();
+    if (!targetPath) return null;
+
+    try {
+      const DatabaseSync = getDatabaseSync();
+      if (!DatabaseSync) return null;
+      const st = statSync(targetPath);
+      const db = new DatabaseSync(targetPath, { readOnly: true, timeout: 50 });
+      const check = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='style_anchors' LIMIT 1")
+        .get();
+      if (!check) {
+        try {
+          db.close?.();
+        } catch {
+          // ignore
+        }
+        return null;
+      }
+      this.db = db;
+      this.activePath = targetPath;
+      this.dbIno = st.ino;
+      this.dbMtimeMs = st.mtimeMs;
+      this.lastStatAt = now;
+      this.stmtCache.clear();
+      return this.db;
+    } catch {
+      this.closeDb();
+      return null;
+    }
+  }
+
+  private stmt(sql: string): any {
+    if (!this.db) return null;
+    let cached = this.stmtCache.get(sql);
+    if (!cached) {
+      cached = this.db.prepare(sql);
+      this.stmtCache.set(sql, cached);
+    }
+    return cached;
+  }
+
+  /**
+   * 内存缓存全表 BGE 向量矩阵（~8.8MB Float32Array）+ 15 类 in_move 质心 + comfort/work 质心
+   */
+  private ensureVectorCache(): VectorCache | null {
+    const db = this.ensureDb();
+    if (!db) return null;
+    if (
+      this.vecCache &&
+      this.vecCache.ino === this.dbIno &&
+      this.vecCache.mtimeMs === this.dbMtimeMs
+    ) {
+      return this.vecCache;
+    }
+
+    try {
+      const tableCheck = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='style_anchor_vectors' LIMIT 1")
+        .get();
+      if (!tableCheck) return null;
+
+      const anchorRows = db.prepare("SELECT * FROM style_anchors").all() as StyleAnchorRow[];
+      const rowsById = new Map<number, StyleAnchorRow>();
+      for (const r of anchorRows) {
+        rowsById.set(r.anchor_id, r);
+      }
+
+      const vecRows = db
+        .prepare("SELECT anchor_id, vec FROM style_anchor_vectors ORDER BY anchor_id ASC")
+        .all() as Array<{ anchor_id: number; vec: Uint8Array }>;
+      if (vecRows.length === 0) return null;
+
+      const firstBytes = vecRows[0]!.vec.byteLength;
+      const dim = firstBytes >> 2;
+      if (dim <= 0) return null;
+
+      const count = vecRows.length;
+      const anchorIds = new Int32Array(count);
+      const matrix = new Float32Array(count * dim);
+
+      const moveCounts = new Map<string, number>();
+      const moveSums = new Map<string, Float32Array>();
+      const comfortSum = new Float32Array(dim);
+
+      for (let i = 0; i < count; i++) {
+        const vr = vecRows[i]!;
+        anchorIds[i] = vr.anchor_id;
+        const u8 = vr.vec;
+        const f32 = new Float32Array(u8.buffer, u8.byteOffset, dim);
+        matrix.set(f32, i * dim);
+
+        const row = rowsById.get(vr.anchor_id);
+        if (!row) continue;
+        const m = row.in_move || "random_chat";
+        moveCounts.set(m, (moveCounts.get(m) ?? 0) + 1);
+
+        let ms = moveSums.get(m);
+        if (!ms) {
+          ms = new Float32Array(dim);
+          moveSums.set(m, ms);
+        }
+        const weight = row.source_bucket === "persona_gold" ? 5.0 : row.source_bucket !== "tieba_banter" ? 2.0 : 1.0;
+        for (let d = 0; d < dim; d++) {
+          ms[d] = ms[d]! + f32[d]! * weight;
+        }
+
+        if ((row.scene_gate === "comfort" || row.in_move === "late_emo") && row.source_bucket !== "tieba_banter") {
+          const cw = row.source_bucket === "persona_gold" ? 3.0 : 1.0;
+          for (let d = 0; d < dim; d++) {
+            comfortSum[d] = comfortSum[d]! + f32[d]! * cw;
+          }
+        }
+      }
+
+      // 使用 BGE 嵌入器预计算典型正经干活指令质心 workCentroid 与深层倾诉原型（耗时 <25ms，仅缓存一次）
+      const embedder = getSharedBgeEmbedder();
+      const workSum = new Float32Array(dim);
+      if (embedder.isReady()) {
+        for (const prompt of WORK_CENTROID_PROMPTS) {
+          const v = embedder.embedQuery(prompt);
+          if (v && v.length === dim) {
+            for (let d = 0; d < dim; d++) {
+              workSum[d] = workSum[d]! + v[d]!;
+            }
+          }
+        }
+        const lateEmoSum = moveSums.get("late_emo") ?? new Float32Array(dim);
+        moveSums.set("late_emo", lateEmoSum);
+        for (const seed of COMFORT_CENTROID_SEEDS) {
+          const v = embedder.embedQuery(seed);
+          if (v && v.length === dim) {
+            for (let d = 0; d < dim; d++) {
+              comfortSum[d] = comfortSum[d]! + v[d]! * 8.0;
+              lateEmoSum[d] = lateEmoSum[d]! + v[d]! * 8.0;
+            }
+          }
+        }
+      }
+
+      const moveCentroids = new Map<string, Float32Array>();
+      for (const [m, s] of moveSums.entries()) {
+        moveCentroids.set(m, normalizeFloatVec(s));
+      }
+      const comfortCentroid = normalizeFloatVec(comfortSum);
+      const workCentroid = normalizeFloatVec(workSum);
+
+      this.vecCache = {
+        ino: this.dbIno,
+        mtimeMs: this.dbMtimeMs,
+        dim,
+        count,
+        anchorIds,
+        matrix,
+        rowsById,
+        moveCounts,
+        moveCentroids,
+        comfortCentroid,
+        workCentroid,
+      };
+      return this.vecCache;
+    } catch {
+      return null;
+    }
+  }
+
+  private getCooldown(scopeKey: string): RingBuffer {
+    let ring = this.cooldownByScope.get(scopeKey);
+    if (!ring) {
+      ring = new RingBuffer(80);
+      this.cooldownByScope.set(scopeKey, ring);
+    }
+    return ring;
+  }
+
+  public recordBotReply(scopeKey: string, replyText: string): void {
+    const clean = replyText.trim();
+    if (!clean) return;
+    this.lastReplyByScope.set(scopeKey, clean);
+    observeReply(scopeKey, clean);
+  }
+
+  /**
+   * 纯 BGE 512 维向量语义分类：Top-15 加权近邻投票 (Weighted k-NN) + 类质心余弦相似度
+   * 仅保留物理附件 hasFile ([文件:...]) 硬判 work_delivery，其余文本彻底废除死板正则！
+   */
+  public classifyByVector(rawText: string, hasMedia = false): SemanticClassification {
+    const { text, hasFile } = stripMediaPlaceholders(rawText || "");
+    if (hasFile) {
+      return {
+        sceneGate: "work_delivery",
+        inMove: "ask_help",
+        qVec: null,
+        workSim: 1,
+        comfortSim: 0,
+        top1Sim: 0,
+      };
+    }
+    if (!text) {
+      return {
+        sceneGate: "casual",
+        inMove: hasMedia ? "daily_share" : "random_chat",
+        qVec: null,
+        workSim: 0,
+        comfortSim: 0,
+        top1Sim: 0,
+      };
+    }
+
+    const vCache = this.ensureVectorCache();
+    const embedder = getSharedBgeEmbedder();
+    const qVec = embedder.isReady() ? embedder.embedQuery(text) : null;
+
+    if (!vCache || !qVec || qVec.length !== vCache.dim) {
+      return {
+        sceneGate: "casual",
+        inMove: hasMedia ? "daily_share" : "random_chat",
+        qVec,
+        workSim: 0,
+        comfortSim: 0,
+        top1Sim: 0,
+      };
+    }
+
+    const { count, dim, matrix, anchorIds, rowsById, moveCounts, moveCentroids, comfortCentroid, workCentroid } = vCache;
+    const workSim = dotVec(qVec, workCentroid);
+    const comfortSim = dotVec(qVec, comfortCentroid);
+
+    // 扫描全库 4,185 条归一化锚点向量，取 Top-15 近邻
+    const topK = 15;
+    const topSims = new Float32Array(topK).fill(-2);
+    const topIds = new Int32Array(topK).fill(-1);
+
+    for (let i = 0; i < count; i++) {
+      const aid = anchorIds[i]!;
+      let dot = 0;
+      const offset = i * dim;
+      for (let d = 0; d < dim; d++) {
+        dot += qVec[d]! * matrix[offset + d]!;
+      }
+      if (dot > topSims[topK - 1]!) {
+        let pos = topK - 1;
+        while (pos > 0 && dot > topSims[pos - 1]!) {
+          topSims[pos] = topSims[pos - 1]!;
+          topIds[pos] = topIds[pos - 1]!;
+          pos--;
+        }
+        topSims[pos] = dot;
+        topIds[pos] = aid;
+      }
+    }
+
+    const top1Sim = topSims[0] ?? 0;
+
+    // 1. 正经干活指令判定：与 workCentroid 余弦显著高于闲聊/吐槽近邻
+    if (workSim > 0.68 && workSim > top1Sim + 0.04) {
+      return {
+        sceneGate: "work_delivery",
+        inMove: "ask_help",
+        qVec,
+        workSim,
+        comfortSim,
+        top1Sim,
+      };
+    }
+
+    // 2. Top-15 近邻加权投票 (Weighted k-NN)
+    const votes = new Map<string, number>();
+    let comfortVote = 0;
+    let totalVote = 0;
+
+    for (let k = 0; k < topK; k++) {
+      const sim = topSims[k]!;
+      const aid = topIds[k]!;
+      if (aid < 0 || sim < 0.42) continue;
+      const row = rowsById.get(aid);
+      if (!row) continue;
+
+      const rankW = 1.0 / (k + 1.5);
+      const bucketW = row.source_bucket === "persona_gold" ? 2.2 : row.source_bucket !== "tieba_banter" ? 1.3 : 0.85;
+      const freqNorm = Math.pow(100 / Math.max(20, moveCounts.get(row.in_move) ?? 100), 0.25);
+      const w = Math.pow(Math.max(0, sim - 0.38), 2) * rankW * bucketW * freqNorm;
+
+      votes.set(row.in_move, (votes.get(row.in_move) ?? 0) + w);
+      totalVote += w;
+      if (row.scene_gate === "comfort" || row.in_move === "late_emo") {
+        comfortVote += w;
+      }
+    }
+
+    // 3. 融合 Top-15 k-NN 投票占比与 15 类质心余弦相似度
+    let bestMove = hasMedia ? "daily_share" : "random_chat";
+    let bestScore = -1;
+    let maxOtherCentroidSim = 0;
+
+    for (const [m, cVec] of moveCentroids.entries()) {
+      const cSim = dotVec(qVec, cVec);
+      if (m !== "late_emo" && cSim > maxOtherCentroidSim) {
+        maxOtherCentroidSim = cSim;
+      }
+      const knnShare = totalVote > 0 ? (votes.get(m) ?? 0) / totalVote : 0;
+      const combined = knnShare * 0.72 + Math.max(0, cSim - 0.42) * 0.9;
+      if (combined > bestScore) {
+        bestScore = combined;
+        bestMove = m;
+      }
+    }
+
+    const comfortRatio = totalVote > 0 ? comfortVote / totalVote : 0;
+    const isComfort =
+      bestMove === "late_emo" ||
+      comfortRatio >= 0.32 ||
+      (comfortSim > 0.58 && comfortSim > maxOtherCentroidSim + 0.02 && comfortSim > top1Sim - 0.03);
+
+    const sceneGate: "work_delivery" | "comfort" | "casual" = isComfort ? "comfort" : "casual";
+    const inMove = isComfort ? "late_emo" : bestMove;
+
+    return {
+      sceneGate,
+      inMove,
+      qVec,
+      workSim,
+      comfortSim,
+      top1Sim,
+    };
+  }
+
+  public classifySceneGate(rawText: string): "work_delivery" | "comfort" | "casual" {
+    return this.classifyByVector(rawText, false).sceneGate;
+  }
+
+  public detectInMove(cleanText: string, hasMedia = false): string {
+    return this.classifyByVector(cleanText, hasMedia).inMove;
+  }
+
+  private calcJaccard(termsA: Set<string>, termsBList: string[]): number {
+    if (termsA.size === 0 || termsBList.length === 0) return 0;
+    const expandedB = new Set<string>();
+    for (const rawTerm of termsBList) {
+      const lower = String(rawTerm).toLowerCase().trim();
+      if (!lower) continue;
+      expandedB.add(lower);
+      for (const sub of extractSlidingTerms(lower)) {
+        expandedB.add(sub);
+      }
+    }
+    if (expandedB.size === 0) return 0;
+    let intersect = 0;
+    for (const t of expandedB) {
+      if (termsA.has(t)) intersect++;
+    }
+    const union = termsA.size + expandedB.size - intersect;
+    return union > 0 ? intersect / union : 0;
+  }
+
+  private calcReplyLiteralOverlap(userTerms: Set<string>, replyText: string): number {
+    if (userTerms.size === 0 || !replyText) return 0;
+    const replyTerms = extractSlidingTerms(replyText);
+    if (replyTerms.size === 0) return 0;
+    let hit = 0;
+    for (const t of replyTerms) {
+      if (userTerms.has(t)) hit++;
+    }
+    return hit / Math.max(1, replyTerms.size);
+  }
+
+  public rollHandfeelGuidance(inMove: string): string {
+    const db = this.ensureDb();
+    let dist: StyleDistributionRow | null = null;
+    if (db) {
+      try {
+        const s = this.stmt("SELECT * FROM style_distributions WHERE in_move = ? LIMIT 1");
+        dist = (s?.get(inMove) as StyleDistributionRow | undefined) ?? null;
+      } catch {
+        this.closeDb();
+        dist = null;
+      }
+    }
+
+    const p25 = dist?.len_p25 ?? 6;
+    const p50 = dist?.len_p50 ?? 12;
+    const p75 = dist?.len_p75 ?? 20;
+    const multiLineProb = dist?.multi_line_prob ?? 0.25;
+
+    const isMultiLine = Math.random() < multiLineProb;
+    if (isMultiLine) {
+      const minLen = Math.max(8, p25 + 2);
+      const maxLen = Math.max(minLen + 4, p75 + 4);
+      return `拆2条短句，共${minLen}~${maxLen}字，不打句号`;
+    }
+    const minLen = Math.max(4, p25);
+    const maxLen = Math.max(minLen + 4, p50 + 4);
+    return `1条短句，${minLen}~${maxLen}字，不打句号`;
+  }
+
+  /**
+   * BGE Dense 向量路 + Intl.Segmenter 中文分词 BM25 路 + RRF 混合召回
+   * 优先直读上游 DeepSeek <nudge_hint> 传入的 llmSceneGate / llmInMove，缺省时走 BGE 向量分类
+   */
+  public retrievePromptBlock(rawUserText: string, options: RetrieveOptions = {}): string | null {
+    if (!rawUserText && !options.hasMedia) return null;
+
+    const stripped = stripMediaPlaceholders(rawUserText || "");
+    const cleanText = stripped.text;
+    const hasMedia = stripped.hasMedia || !!options.hasMedia;
+
+    if (!cleanText && !hasMedia) return null;
+
+    // 若物理包含 [文件:...]，直接认定为正经干活不注入闲聊锚点
+    if (stripped.hasFile) {
+      return null;
+    }
+
+    let scene: "work_delivery" | "comfort" | "casual";
+    let inMove: string;
+    let precomputedQVec: Float32Array | null = null;
+
+    if (options.llmSceneGate && options.llmInMove) {
+      scene = options.llmSceneGate;
+      inMove = options.llmInMove;
+    } else {
+      const vecClass = this.classifyByVector(rawUserText || "", hasMedia);
+      scene = options.llmSceneGate ?? vecClass.sceneGate;
+      inMove = options.llmInMove ?? vecClass.inMove;
+      precomputedQVec = vecClass.qVec;
+    }
+
+    if (scene === "work_delivery") {
+      return null;
+    }
+
+    const scopeKey = options.scopeKey ?? "default:channel";
+    const isPrivate =
+      options.isPrivate ??
+      (scopeKey.startsWith("direct:") || scopeKey.startsWith("private:") || scopeKey.includes(":private:"));
+    const isMaster =
+      options.isMaster ??
+      ([...MASTER_IDS].some((id) => scopeKey.includes(id)) || (isPrivate && scopeKey.endsWith("2596464506")));
+    const safety: 0 | 1 | 2 | 3 = options.safety ?? (isMaster ? 3 : isPrivate ? 1 : 2);
+    const hour = options.hour ?? new Date().getHours();
+
+    // 1. 计算语气词门控提示（透传 sceneGate 与 inMove）
+    let spiceBlock = "";
+    if (cleanText) {
+      try {
+        const turnCtx: TurnCtx = {
+          channel: scopeKey,
+          isPrivate,
+          isMaster,
+          text: cleanText,
+          sceneGate: scene,
+          inMove,
+          safety,
+          hour,
+          mood: options.mood ?? 0,
+          lastBotReply: options.lastBotReply ?? this.lastReplyByScope.get(scopeKey),
+        };
+        spiceBlock = spiceHint(turnCtx);
+      } catch {
+        spiceBlock = "";
+      }
+    }
+
+    // 2. 双路混合检索真人语感锚点库 (Dense BGE Top-50 + Sparse Segmented BM25 Top-50 -> RRF Fusion)
+    const anchorLines: string[] = [];
+    const db = this.ensureDb();
+    if (db) {
+      try {
+        const currentTerms = extractSlidingTerms(cleanText);
+        const isComfortOrMaster = scene === "comfort" || (isPrivate && isMaster);
+        const cooldown = this.getCooldown(scopeKey);
+
+        const denseRanks = new Map<number, { rank: number; sim: number }>();
+        const sparseRanks = new Map<number, { rank: number; bm25: number }>();
+        const candidateMap = new Map<number, StyleAnchorRow>();
+
+        // 路 1：Dense BGE 语义向量检索 Top-50（复用已计算的 qVec 避免二次推理）
+        const vCache = this.ensureVectorCache();
+        if (vCache && cleanText) {
+          const qVec = precomputedQVec ?? getSharedBgeEmbedder().embedQuery(cleanText);
+          if (qVec && qVec.length === vCache.dim) {
+            const { count, dim, matrix, anchorIds, rowsById } = vCache;
+            const sims: Array<{ id: number; sim: number; row: StyleAnchorRow }> = [];
+            for (let i = 0; i < count; i++) {
+              const aid = anchorIds[i]!;
+              const row = rowsById.get(aid);
+              if (!row) continue;
+              if (row.scene_gate === "work_delivery") continue;
+              if (isComfortOrMaster) {
+                if (row.scene_gate !== "comfort" && row.scene_gate !== "all_casual") continue;
+                if (row.source_bucket === "tieba_banter") continue;
+              } else if (row.scene_gate === "comfort" && inMove !== "late_emo") {
+                continue;
+              }
+
+              let dot = 0;
+              const offset = i * dim;
+              for (let d = 0; d < dim; d++) {
+                dot += qVec[d]! * matrix[offset + d]!;
+              }
+              sims.push({ id: aid, sim: dot, row });
+            }
+            sims.sort((a, b) => b.sim - a.sim);
+            const topDense = sims.slice(0, 50);
+            for (let r = 0; r < topDense.length; r++) {
+              const item = topDense[r]!;
+              denseRanks.set(item.id, { rank: r + 1, sim: item.sim });
+              candidateMap.set(item.id, item.row);
+            }
+          }
+        }
+
+        // 路 2：Sparse Intl.Segmenter 中文分词 FTS5 BM25 Top-50
+        const segQuery = buildSafeSegmentedFtsQuery(cleanText, 24);
+        if (segQuery) {
+          try {
+            const ftsSql = isComfortOrMaster
+              ? `
+                SELECT a.*, bm25(style_anchors_seg_fts, 2.0, 1.0, 1.5) AS bm25_score
+                FROM style_anchors_seg_fts
+                JOIN style_anchors a ON style_anchors_seg_fts.rowid = a.anchor_id
+                WHERE style_anchors_seg_fts MATCH ?
+                  AND a.scene_gate IN ('comfort', 'all_casual')
+                  AND a.source_bucket != 'tieba_banter'
+                ORDER BY bm25(style_anchors_seg_fts, 2.0, 1.0, 1.5) ASC
+                LIMIT 50
+              `
+              : `
+                SELECT a.*, bm25(style_anchors_seg_fts, 2.0, 1.0, 1.5) AS bm25_score
+                FROM style_anchors_seg_fts
+                JOIN style_anchors a ON style_anchors_seg_fts.rowid = a.anchor_id
+                WHERE style_anchors_seg_fts MATCH ?
+                  AND a.scene_gate != 'work_delivery'
+                ORDER BY bm25(style_anchors_seg_fts, 2.0, 1.0, 1.5) ASC
+                LIMIT 50
+              `;
+            const ftsRows = (this.stmt(ftsSql)?.all(segQuery) as StyleAnchorRow[]) ?? [];
+            for (let r = 0; r < ftsRows.length; r++) {
+              const row = ftsRows[r]!;
+              sparseRanks.set(row.anchor_id, { rank: r + 1, bm25: Math.abs(Number(row.bm25_score ?? 0)) });
+              if (!candidateMap.has(row.anchor_id)) {
+                candidateMap.set(row.anchor_id, row);
+              }
+            }
+          } catch {
+            // 若 style_anchors_seg_fts 不存在则回退 trigram
+          }
+        }
+
+        // 球路补充：确保同 in_move 的高分 persona_gold 与优质候选入池
+        const moveSql = isComfortOrMaster
+          ? `
+            SELECT * FROM style_anchors
+            WHERE scene_gate IN ('comfort', 'all_casual')
+              AND source_bucket != 'tieba_banter'
+              AND in_move = ?
+            ORDER BY (source_bucket = 'persona_gold') DESC, quality_score DESC
+            LIMIT 25
+          `
+          : `
+            SELECT * FROM style_anchors
+            WHERE scene_gate != 'work_delivery'
+              AND in_move = ?
+            ORDER BY (source_bucket = 'persona_gold') DESC, quality_score DESC
+            LIMIT 25
+          `;
+        const moveFallback = (this.stmt(moveSql)?.all(inMove) as StyleAnchorRow[]) ?? [];
+        for (const row of moveFallback) {
+          if (!candidateMap.has(row.anchor_id)) {
+            candidateMap.set(row.anchor_id, row);
+          }
+        }
+
+        const allCandidates = Array.from(candidateMap.values());
+        if (allCandidates.length > 0) {
+          const fresh = allCandidates.filter((c) => !cooldown.has(c.anchor_id));
+          const pool = fresh.length >= 4 ? fresh : allCandidates;
+
+          // RRF (Reciprocal Rank Fusion, k=25) + 语义相似度 + 球路加权 + 防抄词惩罚
+          const RRF_K = 25;
+          const scored = pool.map((c) => {
+            const dInfo = denseRanks.get(c.anchor_id);
+            const sInfo = sparseRanks.get(c.anchor_id);
+
+            const rrfDense = dInfo ? 1.0 / (RRF_K + dInfo.rank) : 0;
+            const rrfSparse = sInfo ? 1.0 / (RRF_K + sInfo.rank) : 0;
+            const rrfScore = (rrfDense * 1.35 + rrfSparse * 1.15) * 18.0; // 归一化至 ~0..1.0
+
+            const denseSimBonus = dInfo ? Math.max(0, dInfo.sim - 0.45) * 1.4 : 0;
+            const bothHitBonus = dInfo && sInfo ? 0.22 : 0;
+
+            let topicTerms: string[] = [];
+            try {
+              topicTerms = JSON.parse(c.topic_terms_json || "[]");
+            } catch {
+              topicTerms = [];
+            }
+            const topicJaccard = this.calcJaccard(currentTerms, topicTerms);
+            const replyOverlap = this.calcReplyLiteralOverlap(currentTerms, c.raw_reply);
+
+            // 惩罚与群友原话字面高度复读的回复 (>0.55)
+            const parrotPenalty = replyOverlap > 0.55 ? (replyOverlap - 0.55) * 1.5 : 0;
+            // 若圈层黑话强但与当前话题词完全无关，适度扣分；若恰好命中当前话题词，反而给奖励
+            const specificityAdj =
+              topicJaccard > 0
+                ? Math.min(0.25, topicJaccard * 0.4)
+                : c.domain_specificity >= 2
+                  ? -0.18
+                  : 0;
+
+            const moveBonus = c.in_move === inMove ? 0.38 : 0.0;
+            const goldBonus = c.source_bucket === "persona_gold" && (c.in_move === inMove || dInfo || sInfo) ? 0.22 : 0;
+            const qualityNorm = ((c.quality_score || 6) / 10) * 0.18;
+            const jitter = 0.04 * Math.random();
+
+            const totalScore =
+              rrfScore +
+              denseSimBonus +
+              bothHitBonus +
+              moveBonus +
+              goldBonus +
+              qualityNorm +
+              specificityAdj -
+              parrotPenalty +
+              jitter;
+
+            return { item: c, score: totalScore, dInfo, sInfo, topicTerms, topicJaccard };
+          });
+
+          scored.sort((a, b) => b.score - a.score);
+
+          // 精选 Top-4：不再强行凑低分桶（若 daily_casual 无高分候选绝不硬塞），只保证 out_move 切入角度不重复！
+          const selected: StyleAnchorRow[] = [];
+          const usedOutMoves = new Set<string>();
+          const bucketCount = new Map<string, number>();
+          const topScore = scored[0]?.score ?? 0;
+          const minAcceptableScore = Math.max(0.35, topScore * 0.48);
+
+          // 第一轮：优先挑分数过线且 out_move 不重复、单桶不超过 2 条的高分锚点
+          for (const s of scored) {
+            if (selected.length >= 4) break;
+            if (s.score < minAcceptableScore && selected.length >= 2) break;
+            if (usedOutMoves.has(s.item.out_move)) continue;
+            const bCnt = bucketCount.get(s.item.source_bucket) ?? 0;
+            if (bCnt >= 2) continue;
+
+            selected.push(s.item);
+            usedOutMoves.add(s.item.out_move);
+            bucketCount.set(s.item.source_bucket, bCnt + 1);
+          }
+
+          // 兜底补齐：确保至少有 3~4 条不同 out_move 的候选
+          for (const s of scored) {
+            if (selected.length >= 4) break;
+            if (selected.some((sel) => sel.anchor_id === s.item.anchor_id)) continue;
+            if (!usedOutMoves.has(s.item.out_move) || selected.length < 2) {
+              selected.push(s.item);
+              usedOutMoves.add(s.item.out_move);
+            }
+          }
+
+          for (const sel of selected) {
+            cooldown.add(sel.anchor_id);
+            let replyText = sel.raw_reply;
+            let isSkeleton = false;
+
+            if (sel.domain_specificity >= 2) {
+              let topicTerms: string[] = [];
+              try {
+                topicTerms = JSON.parse(sel.topic_terms_json || "[]");
+              } catch {
+                topicTerms = [];
+              }
+              const hasOverlap = this.calcJaccard(currentTerms, topicTerms) > 0;
+              if (!hasOverlap && sel.skeleton_template) {
+                replyText = sel.skeleton_template;
+                isSkeleton = true;
+              }
+            }
+
+            const label = isSkeleton ? "骨架" : "原句";
+            anchorLines.push(`- [${sel.source_bucket}|${sel.out_move}] (${label}): ${replyText}`);
+          }
+        }
+      } catch {
+        this.closeDb();
+      }
+    }
+
+    const handfeel = this.rollHandfeelGuidance(inMove);
+    const parts: string[] = [
+      `<style_handfeel>`,
+      `[真人语感接话锚点 (可选灵感：先判断与当前上下文是否契合；若觉得不贴切或有违和感请直接完全忽略，按你自己的判断自然接话，严禁生搬硬套或照抄词句)]:`,
+      ...(anchorLines.length > 0 ? anchorLines : [`- [本轮无匹配原句，按自然短句接话]`]),
+      `本轮手感掷骰: ${handfeel}`,
+      `</style_handfeel>`,
+    ];
+    if (spiceBlock) {
+      parts.push(spiceBlock);
+    }
+    return parts.join("\n");
+  }
+}

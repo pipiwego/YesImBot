@@ -1,0 +1,302 @@
+// spice-gate.ts —— 语气词稀疏门控 + 冲度预算 + 软调料盘（内联词表，无 JSON import 依赖）
+
+type Word = {
+  readonly w: string;
+  readonly e: number;
+  readonly t: "thing" | "self" | "person";
+  readonly pos: string;
+  readonly priv?: boolean;
+};
+
+type Cluster = {
+  readonly id: string;
+  readonly base: number;
+  readonly minSafety: number;
+  readonly moves: readonly string[];
+  readonly cue: string;
+  readonly read: string;
+  readonly words: readonly Word[];
+  readonly needBanter?: boolean;
+};
+
+export interface TurnCtx {
+  channel: string;
+  isPrivate: boolean;
+  isMaster: boolean;
+  text: string;
+  sceneGate?: "work_delivery" | "comfort" | "casual"; // 向量/LLM 传入的场景闸门
+  inMove?: string; // 向量/LLM 传入的 15 类 in_move 分类结果
+  safety: 0 | 1 | 2 | 3; // 0生人 1普通群友 2互损老友 3Misaki(群里)
+  hour: number;
+  mood?: number; // mood: -1烦躁 0平 1开心（情绪余温）
+  lastBotReply?: string;
+}
+
+interface ChanState {
+  turn: number;
+  budget: number;
+  cool: number;
+  recent: string[];
+  hurt: number;
+  banter: number;
+}
+
+const SPICE_TABLE = {
+  veto: "难过|想哭|哭了|分手|挂科|被裁|裁员|生病|住院|去世|走了|焦虑|抑郁|失眠|崩溃了|撑不住|好累|不想活",
+  hurt: "^(哦+|嗯+|行吧|算了|好吧|。+|…+|\\.+|你好凶|有必要吗|不至于吧?|没意思)$",
+  banterIn: "急了|破防|就这|典|你不行|菜就|嘴硬|笑死你|bot就是",
+  clusters: [
+    {
+      id: "logic",
+      base: 0.28,
+      minSafety: 1,
+      moves: ["hot_take", "meme_throw", "argue", "random_chat"],
+      cue: "我觉得|其实|根本|反正|所以说|才是|应该|不就是|难道",
+      read: "对方刚抛出一个让人瞳孔地震的离谱逻辑/暴论（冲的是逻辑，不是人）",
+      words: [
+        { w: "不是", e: 1, t: "thing", pos: "句首，后面接逗号再说正事", priv: true },
+        { w: "啊？", e: 0, t: "thing", pos: "单独一行" },
+        { w: "？", e: 1, t: "thing", pos: "单独一行，只发这一个" },
+        { w: "不是哥们", e: 2, t: "person", pos: "句首" },
+      ],
+    },
+    {
+      id: "funny",
+      base: 0.24,
+      minSafety: 0,
+      moves: ["daily_share", "self_mock", "show_off", "random_chat", "meme_throw"],
+      cue: "哈哈|笑死|居然|竟然|结果|离谱|草|绷|乐",
+      read: "事情荒诞好笑，但没人真受伤",
+      words: [
+        { w: "难绷", e: 1, t: "thing", pos: "单独一行或句首", priv: true },
+        { w: "草", e: 0, t: "self", pos: "单独一个字", priv: true },
+        { w: "笑死", e: 0, t: "self", pos: "句首", priv: true },
+        { w: "绷不住了", e: 1, t: "self", pos: "句尾", priv: true },
+      ],
+    },
+    {
+      id: "outrage",
+      base: 0.22,
+      minSafety: 1,
+      moves: ["daily_share", "random_chat", "complain", "hot_take"],
+      cue: "有个人|同事|室友|队友|网上|新闻|主播|老板|甲方|路人",
+      read: "对方在转述第三方的奇葩操作，你和他站同一边看乐子",
+      words: [
+        { w: "逆天", e: 1, t: "thing", pos: "评价那件事，别评价眼前的人", priv: true },
+        { w: "抽象", e: 1, t: "thing", pos: "任意" },
+        { w: "神人", e: 2, t: "person", pos: "只能指被转述的第三方" },
+        { w: "这也行", e: 0, t: "thing", pos: "句尾", priv: true },
+      ],
+    },
+    {
+      id: "doom",
+      base: 0.22,
+      minSafety: 1,
+      moves: ["flag", "self_mock", "tech_bug", "urge_team", "complain"],
+      cue: "输了|又输|翻车|没了|完蛋|这次一定|保证|flag|立个|稳了|连跪|迟到",
+      read: "结局已定或即将翻车，但损失很轻（游戏/小Flag/自己的小倒霉），适合自嘲或轻量看乐子",
+      words: [
+        { w: "寄", e: 1, t: "thing", pos: "单独一个字或'这不得寄'", priv: false },
+        { w: "我寄了", e: 0, t: "self", pos: "只用于说你自己", priv: true },
+        { w: "似了", e: 1, t: "thing", pos: "句尾" },
+        { w: "完了", e: 0, t: "thing", pos: "句首", priv: true },
+      ],
+    },
+    {
+      id: "crash",
+      base: 0.2,
+      minSafety: 0,
+      moves: ["tech_bug"],
+      cue: "报错|崩了|闪退|蓝屏|error|Error|炸了|卡死|打不开|跑不起来",
+      read: "东西在物理意义上崩了（程序/服务器/存档），对象是机器不是人",
+      words: [
+        { w: "崩了", e: 0, t: "thing", pos: "任意", priv: true },
+        { w: "炸了", e: 0, t: "thing", pos: "任意", priv: true },
+        { w: "好家伙", e: 0, t: "thing", pos: "句首", priv: true },
+      ],
+    },
+    {
+      id: "stereo",
+      base: 0.18,
+      minSafety: 2,
+      moves: ["flag", "hot_take", "show_off", "argue", "self_mock"],
+      cue: "又|果然|每次|老样子|我就说|一如既往|还是",
+      read: "熟人的行为完美兑现了他一贯的德性/之前的预言，属于'果然是你'；只针对行为，绝不针对性别地域群体",
+      words: [
+        { w: "典", e: 2, t: "person", pos: "单独一个字" },
+        { w: "典中典", e: 2, t: "person", pos: "单独一行" },
+        { w: "经典", e: 1, t: "thing", pos: "句首" },
+        { w: "果然", e: 0, t: "thing", pos: "句首", priv: true },
+      ],
+    },
+    {
+      id: "counter",
+      base: 0.35,
+      minSafety: 2,
+      moves: ["tease_bot", "argue"],
+      needBanter: true,
+      cue: "诗音|你|bot|机器人",
+      read: "对方先开火损你、现在嘴硬或恼羞——互损回合，你可以顶回去",
+      words: [
+        { w: "急了", e: 3, t: "person", pos: "单独两个字" },
+        { w: "破防了", e: 3, t: "person", pos: "句尾" },
+        { w: "嘴硬", e: 2, t: "person", pos: "任意" },
+        { w: "就这", e: 3, t: "person", pos: "单独一行" },
+      ],
+    },
+    {
+      id: "wow",
+      base: 0.2,
+      minSafety: 0,
+      moves: ["show_off", "daily_share"],
+      cue: "做了|画了|拿到|抽到|买了|上岸|通过|出了|出货",
+      read: "对方晒的是真东西/真成就，可以服气，但别谄媚",
+      words: [
+        { w: "牛", e: 0, t: "thing", pos: "单独一个字", priv: true },
+        { w: "有点东西", e: 0, t: "thing", pos: "任意", priv: true },
+        { w: "我草", e: 1, t: "self", pos: "句首" },
+        { w: "好家伙", e: 0, t: "thing", pos: "句首", priv: true },
+      ],
+    },
+  ] satisfies readonly Cluster[],
+  softPriv: ["欸——", "呜", "哼", "真是的", "笨蛋"] as const,
+  banAlways: "傻逼|sb|nmsl|寄吧|小丑|下头|普信|蝻|女拳|孝子|我是你爹|屌|逼",
+};
+
+const S = new Map<string, ChanState>();
+const C: readonly Cluster[] = SPICE_TABLE.clusters;
+const re = (s: string) => new RegExp(s, "i");
+const VETO = re(SPICE_TABLE.veto);
+const HURT = re(SPICE_TABLE.hurt);
+const BANTER_IN = re(SPICE_TABLE.banterIn);
+const NO_SPICE_MOVES = new Set(["late_emo", "praise_bot", "ask_help", "complain_serious"]);
+
+// 语义 inMove 到首选簇 id 的映射（无关键词时亦可精准选簇）
+const MOVE_PRIMARY_CLUSTER: Record<string, string> = {
+  hot_take: "logic",
+  meme_throw: "funny",
+  self_mock: "funny",
+  daily_share: "funny",
+  complain: "outrage",
+  flag: "doom",
+  urge_team: "doom",
+  tech_bug: "crash",
+  show_off: "wow",
+  tease_bot: "counter",
+  argue: "counter",
+};
+
+// 只把冲度≥1 的词当"带刺"观测；「不是」在正常句里太常见，只认句首用法
+const ALL_WORDS = [
+  ...new Set(C.flatMap((c) => c.words.filter((w) => w.e >= 1 && w.w !== "不是" && w.w !== "？").map((w) => w.w))),
+];
+
+const spiky = (r: string) =>
+  ALL_WORDS.filter((w) => r.includes(w)).concat(/(^|\n)不是[，, ]/.test(r) ? ["不是"] : []);
+
+const BUDGET_MAX = 3;
+const REGEN = 0.5;
+
+function st(ch: string): ChanState {
+  let s = S.get(ch);
+  if (!s) {
+    s = { turn: 0, budget: 2, cool: 0, recent: [], hurt: 0, banter: 0 };
+    S.set(ch, s);
+  }
+  return s;
+}
+
+// 生成后回调：不论是否注入，只要回复里真出现了梗词就扣预算（模型会自发模仿历史里的自己）
+export function observeReply(ch: string, reply: string): void {
+  const s = st(ch);
+  const used = spiky(reply);
+  if (!used.length) return;
+  const cost = Math.max(...used.map((w) => C.flatMap((c) => c.words).find((x) => x.w === w)?.e ?? 1)) + 1;
+  s.budget = Math.max(0, s.budget - cost);
+  s.cool = Math.max(s.cool, 1 + Math.ceil(cost / 2));
+  s.recent = [...used, ...s.recent].slice(0, 10);
+}
+
+function maxEdge(c: TurnCtx, s: ChanState): number {
+  if (c.isPrivate && c.isMaster) return 1; // 私聊 Misaki：最多到「难绷/不是」这一档
+  const cap = [0, 1, 2, 3][c.safety] - (s.hurt > 0 ? 2 : 0) - (c.mood === 1 ? 1 : 0);
+  return Math.min(cap, Math.floor(s.budget));
+}
+
+export function spiceHint(c: TurnCtx): string {
+  const s = st(c.channel);
+  s.turn++;
+  s.budget = Math.min(BUDGET_MAX, s.budget + REGEN);
+  s.cool = Math.max(0, s.cool - 1);
+  s.hurt = Math.max(0, s.hurt - 1);
+  s.banter = Math.max(0, s.banter - 1);
+  const t = c.text.trim();
+  const hadSpice = !!c.lastBotReply && spiky(c.lastBotReply).length > 0;
+  // ① 受伤回检：上一轮带刺 + 对方回得又短又冷 → 进入修复期，并要求本轮找补
+  if (hadSpice && HURT.test(t)) {
+    s.hurt = 6;
+    s.budget = 0;
+    return `<语气>刚才那句可能扎到对方了。这轮别再玩梗，用你自己别扭的方式把话收回来一点（像"…行吧刚才嘴快了"那种），别正式道歉。</语气>`;
+  }
+  if (BANTER_IN.test(t) || c.inMove === "tease_bot" || c.inMove === "argue") {
+    s.banter = Math.max(s.banter, 3); // 对方先开火或语义判为互损/怼bot → 3 轮内允许互损档
+  }
+  // ② 硬否决：向量/LLM 判为 comfort 或 late_emo/求助/被夸，或命中兜底否决词 → 零调料硬 VETO
+  if (
+    c.sceneGate === "comfort" ||
+    c.sceneGate === "work_delivery" ||
+    c.inMove === "late_emo" ||
+    NO_SPICE_MOVES.has(c.inMove ?? "") ||
+    VETO.test(t)
+  ) {
+    return "";
+  }
+  // ③ 冷却期：上一轮刚冲过，压一下历史自我模仿
+  if (s.cool > 0) return hadSpice ? `<语气>上一句已经够冲了，这句就正常白话说，不用网络感叹词。</语气>` : "";
+  // ④ 语义 inMove 映射优先 + 微语境线索词辅助匹配
+  const primaryClusterId = c.inMove ? MOVE_PRIMARY_CLUSTER[c.inMove] : undefined;
+  const cand = C.map((cl) => {
+    const moveHit = cl.moves.includes(c.inMove ?? "") ? 1.0 : 0;
+    const primaryBonus = cl.id === primaryClusterId ? 0.5 : 0;
+    const cueHit = re(cl.cue).test(t) ? 1.0 : 0;
+    return {
+      cl,
+      sc: moveHit + primaryBonus + cueHit,
+    };
+  })
+    .filter((x) => x.sc >= 1.2 && c.safety >= x.cl.minSafety && (!x.cl.needBanter || s.banter > 0))
+    .sort((a, b) => b.sc - a.sc);
+  if (!cand.length) return "";
+  const { cl, sc } = cand[0];
+  // ⑤ 掷骰：基础概率 × 时段 × 心情 × 匹配强度，私聊减半，硬上限 0.4
+  const tod = c.hour < 10 ? 0.5 : c.hour < 18 ? 1.25 : c.hour < 23 ? 1 : 0.6;
+  const moodF = c.mood === -1 ? 1.2 : c.mood === 1 ? 0.8 : 1;
+  const p = Math.min(
+    0.4,
+    cl.base * tod * moodF * (sc >= 2 ? 1.3 : 1) * (c.isPrivate ? 0.5 : 1) * (s.hurt ? 0.3 : 1),
+  );
+  if (Math.random() >= p) return "";
+  // ⑥ 选词：冲度 ≤ 允许上限；私聊 Misaki 只取 priv；最近用过的排除；person 类需互损窗口
+  const lim = maxEdge(c, s);
+  const pool = cl.words.filter(
+    (w) =>
+      w.e <= lim &&
+      !s.recent.includes(w.w) &&
+      (!(c.isPrivate && c.isMaster) || w.priv) &&
+      (w.t !== "person" || s.banter > 0 || c.safety >= 2),
+  );
+  if (!pool.length) return "";
+  const pick = [...pool].sort(() => Math.random() - 0.5).slice(0, 2);
+  const edge = Math.max(...pick.map((w) => w.e));
+  const soften =
+    c.isPrivate && c.isMaster
+      ? `私聊里语气放软，带点撒娇或"真是的"的嗔怪感，别用贴吧腔。`
+      : edge >= 2
+        ? `这类词有刺：只对事不对人，出口后后半句顺手给个台阶（嘴硬式找补也行）。`
+        : "";
+  return `<语气调料 可选>
+此刻的感觉：${cl.read}。
+本轮可用语气词参考(觉得贴切再用，不顺口直接不用): ${pick.map((w) => `「${w.w}」(${w.pos})`).join(" / ")}，或者用你自己想到的同类说法。
+不顺就完全不用——大多数时候正常说话更像你。最多一个，不要解释它，不要放进引号。${soften}
+</语气调料>`;
+}
