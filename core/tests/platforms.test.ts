@@ -4,6 +4,7 @@ vi.mock("koishi", async () => import("@koishijs/core"));
 
 import { h, type Session } from "koishi";
 
+import { MilkyTranslator } from "../src/platforms/milky.js";
 import { OneBotTranslator } from "../src/platforms/onebot.js";
 
 function createSession(overrides: Record<string, unknown> = {}): Session {
@@ -53,5 +54,30 @@ describe("OneBotTranslator", () => {
 
     expect(record).toMatchObject({ eventType: "notice.poke", targetId: "10000", action: "拍了拍" });
     expect(record).not.toHaveProperty("_data");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R17 / item 5：缺 channelId 的会话不再静默丢弃
+// ---------------------------------------------------------------------------
+
+describe("MilkyTranslator admission logging", () => {
+  it("logs and throttles sessions without a channelId", async () => {
+    const logger = { level: 2, info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
+    const translator = new MilkyTranslator({ logger: () => logger } as never);
+    const session = createSession({ platform: "milky", type: "notice", channelId: undefined });
+
+    await expect(translator.translate(session as never, {} as never)).resolves.toBeNull();
+    await expect(translator.translate({ ...session } as never, {} as never)).resolves.toBeNull();
+
+    expect(logger.info).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: "admission.milky_no_channel",
+        platform: "milky",
+        channelId: "",
+        reason: "missing_channel_id",
+      }),
+    );
   });
 });

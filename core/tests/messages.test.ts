@@ -21,7 +21,7 @@ import {
   type MessageRecord,
   type RecordBase,
 } from "../src/messages/index.js";
-import { parseReply } from "../src/messages/index.js";
+import { parseReply, stripLeadingResidue } from "../src/messages/index.js";
 import { scope } from "./helpers/index.js";
 
 type Input = Message | Event;
@@ -448,5 +448,55 @@ describe("parseReply", () => {
     const segments = parseReply(" r0  not a real capture");
     expect(segments).toHaveLength(1);
     expect(text(segments[0])).toBe("r0 not a real capture");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R17 / item 2：`}]` 残片只在「确实有括号上下文」时剥离
+// ---------------------------------------------------------------------------
+
+describe("leading residue stripping", () => {
+  it("strips a residue that is the tail of a bracketed payload", () => {
+    const segments = parseReply('[{"thought":"plan"}]正文');
+    expect(segments).toHaveLength(1);
+    expect(text(segments[0])).toBe("正文");
+  });
+
+  it("strips a truncated-array residue", () => {
+    const segments = parseReply('{"thought":"plan"}]正文');
+    expect(segments).toHaveLength(1);
+    expect(text(segments[0])).toBe("正文");
+  });
+
+  it("keeps a body that legitimately starts with a bare `}]`", () => {
+    const source = "}] 这就是那段 JSON 的结尾";
+    const segments = parseReply(source);
+    expect(segments).toHaveLength(1);
+    expect(text(segments[0])).toBe(source);
+  });
+
+  it("keeps a body whose leading fragment is not a bracket payload", () => {
+    const source = "{a}]正文";
+    expect(text(parseReply(source)[0])).toBe(source);
+  });
+
+  it("keeps the body when the fragment has no quotes or colons", () => {
+    const source = "[1,2]}]正文";
+    expect(text(parseReply(source)[0])).toBe(source);
+  });
+
+  it("logs a debug line instead of swallowing text when context is missing", () => {
+    const debug = vi.fn();
+    expect(stripLeadingResidue("}]保留", { debug })).toBe("}]保留");
+    expect(debug).toHaveBeenCalledWith(
+      "messages.leading_residue_kept",
+      expect.objectContaining({ reason: "no_bracket_context" }),
+    );
+  });
+
+  it("returns the body untouched when there is no residue at all", () => {
+    const debug = vi.fn();
+    expect(stripLeadingResidue("普通正文", { debug })).toBe("普通正文");
+    expect(debug).not.toHaveBeenCalled();
   });
 });

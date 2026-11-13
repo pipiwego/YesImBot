@@ -23,6 +23,48 @@ import type { Resources } from "./resources/index.js";
 import { Runtimes } from "./runtimes/index.js";
 import { ensureAgentsFile, ensureDefaultPersona } from "./runtimes/prompt.js";
 
+/**
+ * ── 投递失败原因标记（对齐 hub 的四态判定）───────────────────────────────
+ *
+ * hub（`worker_im_bus.py`）判定一次播报只读两处：
+ *   1. `_classify_notify_response(status, body)`：HTTP 状态码 + body 里的
+ *      `produced_message` / `delivered_to_chat` / `accepted` / `delivery_id` /
+ *      `status_url` / `state` / `error` / `last_error` / `message` / `detail` / `reason` / `ok`；
+ *   2. `_poll_notify_status()`：status_url 返回的 `produced_message` / `state` / `error` / `last_error`。
+ * 非 2xx 时它把 `HTTP {code}: {body 前 200 字}` 连同上面的错误字段一起记进
+ * `effects_outbox.last_error`，再拿这段文本去撞 `is_permanent_delivery_error`。
+ *
+ * 也就是说：**能区分「端口不通」和「对端拒收」的信息，只存在于这些字段的文本里**。
+ * 所以这里给出两台机器都能读的稳定词素：
+ *   unreachable   —— 连接层根本没通（ECONNREFUSED / ConnectTimeout / 适配器没连上平台）
+ *   peer_degraded —— 对端活着但拒收/降级（通知子系统 degraded、纯文本兜底被关）
+ * 其它失败保持原样，避免给 hub 制造新的误判。
+ */
+export type DeliveryFailureMarker = "unreachable" | "peer_degraded";
+
+const UNREACHABLE_PATTERN =
+  /ECONNREFUSED|ECONNRESET|EPIPE|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN|ConnectTimeout|connect timeout|connection refused|socket hang up|fetch failed|network error|not connected|disconnected|no-bot-online|no bot is available|websocket.*(?:closed|error)/i;
+
+const PEER_DEGRADED_PATTERN = /degraded|notify-dispatcher-unavailable|plain fallback|fallback disabled/i;
+
+export function classifyDeliveryFailure(text: string): DeliveryFailureMarker | undefined {
+  const value = String(text ?? "").trim();
+  if (!value) return undefined;
+  // 先判 unreachable：连接层失败比「对端说降级」更具体，也更接近运维要先动手的地方
+  if (UNREACHABLE_PATTERN.test(value)) return "unreachable";
+  if (PEER_DEGRADED_PATTERN.test(value)) return "peer_degraded";
+  return undefined;
+}
+
+/** 把标记写进文本前缀：hub 存的就是这段字符串，人也能一眼看出是哪一类。 */
+export function markDeliveryFailure(text: string, hint?: DeliveryFailureMarker): string {
+  const value = String(text ?? "");
+  const marker = hint ?? classifyDeliveryFailure(value);
+  if (!marker) return value;
+  return value.startsWith(`${marker}:`) ? value : `${marker}: ${value}`;
+}
+
+
 export default class YesImBotService extends Service<Config> {
   public static readonly name = "yesimbot";
   public static readonly usage = ``;
@@ -278,6 +320,22 @@ export default class YesImBotService extends Service<Config> {
     res.end(JSON.stringify(body));
   }
 
+  /**
+   * 给投递回执补上失败标记。
+   *
+   * hub 的 `_poll_notify_status()` 只从 `error` / `last_error` 里取原因（取不到才退到
+   * `_delivery_error_text`），所以标记必须同时出现在这两个字段里，并且额外给一个
+   * 结构化的 `reason`，让将来的 hub 不必靠正则。
+   */
+  private decorateNotifyStatus(described: Record<string, unknown>): Record<string, unknown> {
+    const raw = String(described.error ?? described.last_error ?? "").trim();
+    if (!raw) return described;
+    const marker = classifyDeliveryFailure(raw);
+    if (!marker) return described;
+    const marked = markDeliveryFailure(raw, marker);
+    return { ...described, error: marked, last_error: marked, reason: marker };
+  }
+
   private async handleInternalRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = req.url || "/";
     if (req.method === "GET" && url.startsWith("/internal/health")) {
@@ -285,6 +343,8 @@ export default class YesImBotService extends Service<Config> {
         ok: true,
         service: "yesimbot-worker-notify",
         notify: this.notifyStatus,
+        // 与 hub 的四态词表对齐：本机监听失败 = 对端（hub 视角）将看到连接被拒
+        notify_reason: this.notifyStatus === "degraded" ? "peer_degraded" : "ok",
         notify_error: this.notifyError,
         pending_notifications: this.notifyDispatcher?.pending ?? 0,
       });
@@ -299,7 +359,13 @@ export default class YesImBotService extends Service<Config> {
         }
         const dispatcher = this.notifyDispatcher;
         if (!dispatcher) {
-          this.sendJson(res, 503, { ok: false, produced_message: false, retryable: true, error: "notify-dispatcher-unavailable" });
+          this.sendJson(res, 503, {
+            ok: false,
+            produced_message: false,
+            retryable: true,
+            reason: "peer_degraded",
+            error: markDeliveryFailure("notify-dispatcher-unavailable", "peer_degraded"),
+          });
           return;
         }
         const query = new URL(url, "http://127.0.0.1").searchParams;
@@ -312,12 +378,16 @@ export default class YesImBotService extends Service<Config> {
             this.sendJson(res, 404, { ok: false, error: "unknown delivery_id", delivery_id: deliveryId });
             return;
           }
-          this.sendJson(res, 200, { ok: true, ...dispatcher.describe(record) });
+          this.sendJson(res, 200, { ok: true, ...this.decorateNotifyStatus(dispatcher.describe(record)) });
           return;
         }
         if (ticketId) {
           const records = dispatcher.findByTicket(ticketId);
-          this.sendJson(res, 200, { ok: true, ticket_id: ticketId, deliveries: records.map((record) => dispatcher.describe(record)) });
+          this.sendJson(res, 200, {
+            ok: true,
+            ticket_id: ticketId,
+            deliveries: records.map((record) => this.decorateNotifyStatus(dispatcher.describe(record))),
+          });
           return;
         }
         this.sendJson(res, 400, { ok: false, error: "delivery_id or ticket_id is required" });
@@ -391,7 +461,9 @@ export default class YesImBotService extends Service<Config> {
             accepted: false,
             produced_message: false,
             retryable: true,
-            error: "no-bot-online",
+            // 端口/适配器这一层不通：hub 看到的是 unreachable，而不是「对端拒收」
+            reason: "unreachable",
+            error: markDeliveryFailure(`no-bot-online (platform=${platform || "?"} self_id=${selfId || "?"})`, "unreachable"),
             ticket_id: ticketId,
           });
           return;
@@ -404,7 +476,8 @@ export default class YesImBotService extends Service<Config> {
             accepted: false,
             produced_message: false,
             retryable: true,
-            error: "notify-dispatcher-unavailable",
+            reason: "peer_degraded",
+            error: markDeliveryFailure(`notify-dispatcher-unavailable (notify=${this.notifyStatus})`, "peer_degraded"),
             ticket_id: ticketId,
           });
           return;

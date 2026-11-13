@@ -203,3 +203,40 @@ describe("Channels", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// R17 / item 5：坏掉的 manifest 不再只留一条不可读的 error
+// ---------------------------------------------------------------------------
+
+describe("Channels manifest diagnostics", () => {
+  it("logs platform, channel id and reason for a corrupt manifest (throttled)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-channels-bad-manifest-"));
+    roots.push(root);
+    const broken = join(root, "channels", "guild-milky-7777");
+    await mkdir(broken, { recursive: true });
+    await writeFile(join(broken, "channel.json"), "{ this is not json");
+
+    const logger = { level: 2, info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const channels = new Channels(new Context(), { basePath: root });
+    // Context 的 logger 由 Cordis 注册，不能再赋值；改成替换实例上的 logger，
+    // 并在 scan() 的第一次 await 之后（start 前）完成，避免抢不到日志
+    Object.assign(channels as unknown as { logger: unknown }, { logger });
+
+    await channels.start();
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: "storage.manifest_invalid",
+        directoryName: "guild-milky-7777",
+        platform: "milky",
+        type: "guild",
+        channelId: "7777",
+      }),
+    );
+    // 原因必须是可读文本，而不是序列化后变成 `{}` 的 Error 实例
+    const payload = logger.warn.mock.calls[0]![0] as { reason?: unknown };
+    expect(typeof payload.reason).toBe("string");
+    expect(String(payload.reason)).not.toBe("");
+  });
+});

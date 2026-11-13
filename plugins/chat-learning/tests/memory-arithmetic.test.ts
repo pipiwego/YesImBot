@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createEmptyGlobalRuleBank, kindsOf, mergeLocalPatterns, normalizeGlobalRuleBank, selectBoundaries, selectGlobalPatterns } from "../src/global-store.js";
+import { createEmptyGlobalRuleBank, kindsOf, mergeLocalPatterns, normalizeGlobalRuleBank, revokeBoundaries, selectBoundaries, selectGlobalPatterns } from "../src/global-store.js";
 import { buildPromptBlock } from "../src/projector.js";
 import { computeSalience, detectBoundary, explainSalience } from "../src/salience.js";
 import type {
@@ -384,5 +384,45 @@ describe("§5.5 salience", () => {
     // 有 salience 的同一 pattern 排序分只会更高或相等
     const withSalience: GlobalPattern = { ...legacy.patterns[0]!, salience: 1 };
     expect(selectGlobalPatterns({ ...legacy, patterns: [withSalience] }, "response", 1, 8)).toHaveLength(1);
+  });
+});
+
+describe("revokeBoundaries（revokedAt 写入路径）", () => {
+  const baseBank = () => {
+    const one = mergeLocalPatterns(createEmptyGlobalRuleBank(), [], [], [], "chan-a", 1000, { boundaryTexts: ["别在我面前提我妈"] });
+    return mergeLocalPatterns(one, [], [], [], "chan-b", 2000, { boundaryTexts: ["别在我面前提我妈"] });
+  };
+
+  it("按原文撤销只影响指定频道，另一频道仍注入", () => {
+    const bank = baseBank();
+    expect(bank.boundaries).toHaveLength(2);
+    const first = bank.boundaries![0]!;
+
+    const result = revokeBoundaries(bank, { text: "  别在我面前提我妈  ", channelKey: first.channelKey, now: 3000 });
+
+    expect(result.revoked).toEqual([first.id]);
+    expect(result.bank.boundaries!.filter((item) => item.revokedAt === 3000)).toHaveLength(1);
+    expect(result.bank.updatedAt).toBe(3000);
+    expect(selectBoundaries(result.bank)).toHaveLength(1);
+  });
+
+  it("按 id 撤销可跨频道，撤销后再撤一次是空操作", () => {
+    const bank = baseBank();
+    const first = bank.boundaries![0]!;
+    const once = revokeBoundaries(bank, { id: first.id, now: 3000 });
+    expect(once.revoked).toEqual([first.id]);
+    expect(revokeBoundaries(once.bank, { id: first.id, now: 4000 }).revoked).toEqual([]);
+
+    const second = once.bank.boundaries!.find((item) => item.revokedAt === undefined)!;
+    const both = revokeBoundaries(once.bank, { id: second.id, now: 5000 });
+    expect(both.revoked).toEqual([second.id]);
+    expect(selectBoundaries(both.bank)).toHaveLength(0);
+  });
+
+  it("不给 id 也不给原文时不动库", () => {
+    const bank = baseBank();
+    const result = revokeBoundaries(bank, { now: 3000 });
+    expect(result.revoked).toEqual([]);
+    expect(result.bank).toBe(bank);
   });
 });

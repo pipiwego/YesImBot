@@ -69,3 +69,37 @@ describe("rewriteAssistantEntries", () => {
     expect(failed[0]!.data).toBe(assistant.data);
   });
 });
+
+describe("final-style 的超时与输出上限", () => {
+  const assistantEntry = () =>
+    createMessageEntry(createAssistantMessage("原文照发，别卡住"), { id: "timeout-entry", timestamp: 100 });
+
+  it("把 abortSignal 与 maxOutputTokens 传给模型", async () => {
+    mocks.generateText.mockResolvedValue({ text: "草" });
+
+    await rewriteAssistantEntries([assistantEntry()], {} as never, "<style>短句</style>", { maxOutputTokens: 64, timeoutMs: 50 });
+
+    expect(mocks.generateText).toHaveBeenCalledWith(
+      expect.objectContaining({ maxOutputTokens: 64, abortSignal: expect.anything() }),
+    );
+  });
+
+  it("超时跳过改写：保留原文并 warn", async () => {
+    mocks.generateText.mockImplementation((async (args: { abortSignal?: AbortSignal }) => {
+      const signal = args.abortSignal!;
+      await new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })));
+      });
+      return { text: "不该出现" };
+    }) as never);
+    const warn = vi.fn();
+
+    const result = await rewriteAssistantEntries([assistantEntry()], {} as never, "<style>短句</style>", {
+      timeoutMs: 10,
+      logger: { warn },
+    });
+
+    expect((result[0]!.data as unknown as { content: string }).content).toBe("原文照发，别卡住");
+    expect(warn).toHaveBeenCalledWith("chat_learning.final_style_skipped", expect.objectContaining({ reason: "timeout" }));
+  });
+});

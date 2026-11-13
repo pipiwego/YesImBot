@@ -76,9 +76,11 @@ describe("buildPromptBlock", () => {
     expect(block).not.toContain("<message_links>");
     expect(block).not.toContain("<active_chain>");
     expect(block).toContain("<chat_learning_guide>");
-    expect(block).toContain("常见表达和接法");
-    expect(block).toContain("模仿样本中的长度");
-    expect(block).toContain("被要求“笑点解析”时");
+    // guide 现文案（src/projector.ts CHAT_LEARNING_GUIDE）：参考群聊呼吸感、不解释笑点、不照抄样本。
+    // 旧断言（常见表达和接法 / 模仿样本中的长度 / 被要求“笑点解析”时）是更早一轮改 prompt 留下的过期文案。
+    expect(block).toContain("仅作为本群近期说话节奏");
+    expect(block).toContain("仅参考群聊的短句呼吸感");
+    expect(block).toContain("不解释笑点的留白节奏");
     expect(block).toContain("<local_patterns>");
     expect(block).toContain('<style_examples historical="true">');
     expect(block).toContain('chain="h1 -&gt; h2"');

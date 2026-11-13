@@ -46,7 +46,17 @@ export interface DeliveredPayload {
   readonly platform: string;
   readonly selfId: string;
   readonly channel: Universal.Channel;
+  /**
+   * 这条对外消息的 id。**平台返回的真实 id 优先**（`bot.sendMessage` 的返回值），
+   * 平台没给（老适配器 / 只回空数组）时才退回会话内部生成的 uuid。
+   * 调用方拿不准时看 `messageIdSource`，别把两者当同一种 id 用：
+   * 回复引用、撤回、去重都要平台 id，内部 uuid 只用于把事件归因到某一轮。
+   */
   readonly messageId: string;
+  /** `messageId` 的来源。内部 uuid 不是消息 id，不能拿去调平台接口。 */
+  readonly messageIdSource?: "platform" | "internal";
+  /** 内部生成的 assistant 消息 uuid，保留它才能把 delivered 事件对回具体一轮。 */
+  readonly internalMessageId?: string;
   readonly turnId: string;
   readonly text: string;
 }
@@ -241,9 +251,128 @@ function stripInnerThoughtRegions(source: string): string {
     const cutIdx = unclosedMatch.index + (unclosedMatch[0].length - unclosedMatch[1].length);
     next = next.slice(0, cutIdx);
   }
-  // 剥离偶发残留在句首的思考块闭合残片（如 `દૂི( ˊᵕˋ )ૂ҄ ...}]`）
-  next = next.replace(/^[\s\S]{0,600}?\}\]\s*/, "");
+  // 剥离偶发残留在句首的思考块闭合残片（如 `દૂི( ˊᵕˋ )ૂ҄ ...}]`）。
+  // 旧实现是 `next.replace(/^[\s\S]{0,600}?\}\]\s*/, "")`：无条件删掉前 600 字符内
+  // 第一个 `}]` 及其之前的**全部**内容。正文若真的以 `}]` 开头（模型在解释自己输出的
+  // JSON 片段），开头两个字连同前面的整句都会被吃掉。现在只在「残片确实是某个带括号
+  // 负载的尾巴」时才剥，拿不到上下文就原样保留并记一条 debug。
+  next = stripLeadingResidue(next);
   return next;
+}
+
+/** 里层思考/工具负载的闭合残片 `}]` 只可能出现在开头这么多字符以内。 */
+const LEADING_RESIDUE_WINDOW = 600;
+
+/**
+ * 句首残留剥离开关。`parseReply` 是纯函数、没有 logger，调用点（agents/tools、
+ * runtimes/channel）也不该为了一条 debug 改签名，所以日志走模块级注入：
+ * `Messenger` 构造时把 `ctx.logger("yesimbot.messages")` 装进来。
+ */
+export interface MessagesLogger {
+  debug(message: string, ...args: unknown[]): unknown;
+}
+
+let messagesLogger: MessagesLogger | undefined;
+
+export function setMessagesLogger(logger: MessagesLogger | undefined): void {
+  messagesLogger = logger;
+}
+
+export function stripLeadingResidue(source: string, logger: MessagesLogger | undefined = messagesLogger): string {
+  const window = source.slice(0, LEADING_RESIDUE_WINDOW);
+  const index = window.indexOf("}]");
+  if (index < 0) return source;
+  const head = source.slice(0, index + 2);
+  const rest = source.slice(index + 2).replace(/^\s+/, "");
+  const shape = classifyLeadingResidue(head);
+  if (!shape) {
+    // 上下文不足以证明这是残片：原样保留（正文可能真的以 `}]` 开头）
+    debug(logger, "messages.leading_residue_kept", {
+      reason: "no_bracket_context",
+      head: clipForLog(head),
+      restLength: rest.length,
+    });
+    return source;
+  }
+  debug(logger, "messages.leading_residue_stripped", { shape, head: clipForLog(head) });
+  return rest;
+}
+
+/**
+ * 这段「`}]` 结尾的开头」是不是某个带括号负载的尾巴。
+ * 认两种形状：
+ *   json      —— 从某个 `[`/`{` 起到结尾是一个可解析的 JSON 对象/数组；
+ *   brackets  —— 括号配平（允许残留多一个 `]`，即 `{...}]` 这种数组被截断的尾巴），
+ *                并且负载里出现过引号或冒号（排掉 `[1,2]}]` 这类普通文本误判）。
+ * 返回 null 表示拿不到上下文，不该剥。
+ */
+function classifyLeadingResidue(head: string): "json" | "brackets" | null {
+  for (let index = 0; index < head.length - 2; index += 1) {
+    const char = head[index];
+    if (char !== "{" && char !== "[") continue;
+    const fragment = head.slice(index);
+    const shape = bracketFragmentShape(fragment);
+    if (shape) return shape;
+  }
+  return null;
+}
+
+function bracketFragmentShape(fragment: string): "json" | "brackets" | null {
+  if (fragment.length < 4) return null;
+  if (!/[":]/.test(fragment)) return null;
+  // `[{...}]` 是完整 JSON；`{...}]` 是被截断数组的尾巴（多一个 `]`）
+  const candidates = fragment.endsWith("]") ? [fragment, fragment.slice(0, -1)] : [fragment];
+  for (const candidate of candidates) {
+    if (!candidate.startsWith("{") && !candidate.startsWith("[")) continue;
+    if (!isBracketBalanced(candidate)) continue;
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (parsed !== null && typeof parsed === "object") return "json";
+    } catch {
+      // 不是合法 JSON（模型思考块常带未转义换行/裸键），落到括号配平判断
+    }
+    return "brackets";
+  }
+  return null;
+}
+
+/** 括号配平（跳过字符串字面量），越界即判负。 */
+function isBracketBalanced(fragment: string): boolean {
+  let depth = 0;
+  let quote = "";
+  for (let index = 0; index < fragment.length; index += 1) {
+    const char = fragment[index];
+    if (quote) {
+      if (char === "\\") {
+        index += 1;
+        continue;
+      }
+      if (char === quote) quote = "";
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "{" || char === "[") depth += 1;
+    else if (char === "}" || char === "]") {
+      depth -= 1;
+      if (depth < 0) return false;
+    }
+  }
+  return depth === 0 && quote === "";
+}
+
+function clipForLog(value: string): string {
+  return value.length > 120 ? `${value.slice(0, 120)}…` : value;
+}
+
+function debug(logger: MessagesLogger | undefined, message: string, args: Record<string, unknown>): void {
+  try {
+    logger?.debug(message, args);
+  } catch {
+    // 日志失败绝不影响解析
+  }
 }
 
 function unwrapShareCardData(rawData: unknown): string | null {

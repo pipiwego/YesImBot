@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -153,6 +153,77 @@ describe("GlobalBrainStore", () => {
 
       await expect(store.status(scopeA as never)).resolves.toEqual([]);
       expect(warn).toHaveBeenCalled();
+    });
+  });
+});
+
+describe("brain.jsonl compaction", () => {
+  it("压成状态快照：线程只留最新一条，状态与回复读回来不变", async () => {
+    await withTempDir(async (dir) => {
+      const filePath = join(dir, "brain.jsonl");
+      const store = createGlobalBrainStore({
+        filePath,
+        maxDigestThreads: 5,
+        maxDigestReplies: 5,
+        now: () => 1_000,
+        createId: createIdSequence(),
+        // 关掉自动触发，手动验证 compact()
+        compactThresholdBytes: 0,
+      });
+      await store.init();
+      const thread = await store.deposit({ kind: "insight", sourceScope: scopeA as never, content: "群里的黑话：草=笑" });
+      await store.reply({ threadId: thread.id, sourceScope: scopeB as never, content: "收到", replySource: "agent" });
+      // resolve 会再追加一条 thread 记录；read 会给 scopeB 写 seen 记录
+      await store.resolve(thread.id, scopeA as never);
+      for (let i = 0; i < 4; i += 1) await store.read(thread.id, scopeB as never);
+
+      const beforeLines = (await readFile(filePath, "utf8")).trim().split("\n").length;
+      const sizes = await store.compact();
+      const afterLines = (await readFile(filePath, "utf8")).trim().split("\n").length;
+
+      expect(afterLines).toBeLessThan(beforeLines);
+      expect(sizes.afterBytes).toBeLessThan(sizes.beforeBytes);
+
+      const reloaded = await makeStore(dir);
+      const view = await reloaded.read(thread.id);
+      expect(view?.thread.status).toBe("resolved");
+      expect(view?.thread.content).toBe("群里的黑话：草=笑");
+      expect(view?.replies).toHaveLength(1);
+      expect(view?.replies[0]?.content).toBe("收到");
+    });
+  });
+
+  it("超过阈值自动压缩，且不丢任何线程", async () => {
+    await withTempDir(async (dir) => {
+      const filePath = join(dir, "brain.jsonl");
+      const store = createGlobalBrainStore({
+        filePath,
+        maxDigestThreads: 5,
+        maxDigestReplies: 5,
+        now: () => 1_000,
+        createId: createIdSequence(),
+        compactThresholdBytes: 512,
+        compactCheckEvery: 1,
+      });
+      await store.init();
+      const ids: string[] = [];
+      for (let i = 0; i < 6; i += 1) {
+        const thread = await store.deposit({ kind: "share", sourceScope: scopeA as never, content: `第 ${i} 条：${"x".repeat(200)}` });
+        ids.push(thread.id);
+        await store.read(thread.id, scopeB as never);
+        await store.resolve(thread.id, scopeA as never);
+      }
+
+      // 每线程最多 1 条 thread + 1 条 seen；不压缩的话会有 24 行。
+      const lines = (await readFile(filePath, "utf8")).trim().split("\n");
+      expect(lines.length).toBeLessThanOrEqual(13);
+
+      const reloaded = await makeStore(dir);
+      for (const id of ids) {
+        const view = await reloaded.read(id);
+        expect(view?.thread.id).toBe(id);
+        expect(view?.thread.status).toBe("resolved");
+      }
     });
   });
 });

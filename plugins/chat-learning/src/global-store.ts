@@ -407,6 +407,48 @@ export function mergeBoundaries(
 /** 写侧容量上限：selectBoundaries 只是读时截断，不清理磁盘会让库无限增长。 */
 const MAX_BOUNDARY_ROWS = 200;
 
+/**
+ * P1-M1-6：给 revokedAt 一条真正的写入路径。
+ *
+ * 以前只有读侧过滤（selectBoundaries / projector 都跳过 revokedAt），没有任何
+ * 代码会写它 —— 说错/过期的禁忌只能靠 200 行上限自然挤掉。这里提供纯函数，
+ * 命令层用 `store.updateWith` 调用它落盘；撤销后该条边界立刻不再注入提示词，
+ * 但记录保留，便于事后追查是谁、什么时候撤销的。
+ */
+export interface RevokeBoundaryOptions {
+  /** 只撤销这个频道的边界；不传则跨频道。 */
+  readonly channelKey?: string;
+  /** 按 id 撤销（优先级高于 text）。 */
+  readonly id?: string;
+  /** 按原文撤销（归一化空白后精确比较）。 */
+  readonly text?: string;
+  readonly now: number;
+}
+
+export function revokeBoundaries(
+  bank: GlobalRuleBank,
+  options: RevokeBoundaryOptions,
+): { readonly bank: GlobalRuleBank; readonly revoked: readonly string[] } {
+  const wantedText = options.text === undefined ? undefined : normalizeBoundaryText(options.text);
+  if (options.id === undefined && (wantedText === undefined || wantedText.length === 0)) {
+    return { bank, revoked: [] };
+  }
+  const revoked: string[] = [];
+  const boundaries = (bank.boundaries ?? []).map((boundary) => {
+    if (boundary.revokedAt !== undefined) return boundary;
+    if (options.id !== undefined) {
+      if (boundary.id !== options.id) return boundary;
+    } else if (normalizeBoundaryText(boundary.text) !== wantedText) {
+      return boundary;
+    }
+    if (options.channelKey !== undefined && boundary.channelKey !== options.channelKey) return boundary;
+    revoked.push(boundary.id);
+    return { ...boundary, revokedAt: options.now };
+  });
+  if (revoked.length === 0) return { bank, revoked };
+  return { bank: { ...bank, boundaries, updatedAt: options.now }, revoked };
+}
+
 function capBoundaries(rows: readonly BoundaryMemory[]): readonly BoundaryMemory[] {
   if (rows.length <= MAX_BOUNDARY_ROWS) return rows;
   // 保留 strength 最高的，避免把真禁忌挤掉（strength 是 max 聚合、不衰减）。

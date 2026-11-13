@@ -9,6 +9,7 @@ vi.mock("koishi", async () => import("@koishijs/core"));
 
 import type { Config } from "../src/config.js";
 import YesImBotService from "../src/index.js";
+import { classifyDeliveryFailure, markDeliveryFailure } from "../src/service.js";
 
 const config: Config = {
   basePath: "data/yesimbot",
@@ -75,5 +76,47 @@ describe("YesImBotService facade", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R17 / item 1：给 hub 的四态判定留下可识别的失败原因
+// ---------------------------------------------------------------------------
+
+describe("delivery failure markers", () => {
+  it("marks connection-level failures as unreachable", () => {
+    expect(classifyDeliveryFailure("connect ECONNREFUSED 172.20.0.5:3000")).toBe("unreachable");
+    expect(classifyDeliveryFailure("ConnectTimeout: timed out")).toBe("unreachable");
+    expect(classifyDeliveryFailure("No Bot is available for milky:2690928435")).toBe("unreachable");
+    expect(markDeliveryFailure("no-bot-online")).toBe("unreachable: no-bot-online");
+  });
+
+  it("marks peer-side refusal or degradation as peer_degraded", () => {
+    expect(classifyDeliveryFailure("notify-dispatcher-unavailable")).toBe("peer_degraded");
+    expect(markDeliveryFailure("delivery degraded: plain fallback used")).toBe("peer_degraded: delivery degraded: plain fallback used");
+  });
+
+  it("leaves unrelated failures untouched and stays idempotent", () => {
+    expect(classifyDeliveryFailure("Group not found")).toBeUndefined();
+    expect(markDeliveryFailure("Group not found")).toBe("Group not found");
+    expect(markDeliveryFailure("unreachable: ECONNREFUSED")).toBe("unreachable: ECONNREFUSED");
+  });
+
+  it("decorates a status receipt with the marker hub reads", () => {
+    const ctx = new Context();
+    ctx.baseDir = tmpdir();
+    Object.assign(ctx, { "yesimbot.model": {}, database: { get: vi.fn() } });
+    const service = new YesImBotService(ctx as never, { ...config, basePath: join(tmpdir(), `yesimbot-r17-${randomUUID()}`) });
+    const decorate = (service as unknown as { decorateNotifyStatus: (value: Record<string, unknown>) => Record<string, unknown> })
+      .decorateNotifyStatus.bind(service);
+
+    expect(decorate({ state: "failed", error: "fetch failed" })).toMatchObject({
+      state: "failed",
+      reason: "unreachable",
+      error: "unreachable: fetch failed",
+      last_error: "unreachable: fetch failed",
+    });
+    expect(decorate({ state: "failed", error: "Group not found" })).toEqual({ state: "failed", error: "Group not found" });
+    expect(decorate({ state: "delivered", produced_message: true })).toEqual({ state: "delivered", produced_message: true });
   });
 });

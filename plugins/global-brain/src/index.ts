@@ -31,6 +31,11 @@ export default class GlobalBrainPlugin {
       .min(1)
       .default(5 * 1024 * 1024)
       .description("asset/artifact 物化到全局脑 blob 的最大字节数"),
+    brainCompactThresholdMB: Schema.number()
+      .min(1)
+      .max(512)
+      .default(8)
+      .description("brain.jsonl 超过这个体积（MB）时压成状态快照；压缩不丢线程与回复"),
   });
 
   public readonly ctx: Context;
@@ -58,6 +63,7 @@ export default class GlobalBrainPlugin {
       maxDigestThreads: this.config.maxDigestThreads,
       maxDigestReplies: this.config.maxDigestReplies,
       maxBlobBytes: this.config.maxBlobBytes,
+      compactThresholdBytes: this.config.brainCompactThresholdMB * 1024 * 1024,
       logger: this.logger,
     });
     await store.init();

@@ -6,7 +6,7 @@ import { Context, h } from "koishi";
 
 import type { Config } from "../src/config.js";
 import type { EventRecord } from "../src/messages/index.js";
-import { Messenger } from "../src/messengers/index.js";
+import { Messenger, extractPlatformMessageId } from "../src/messengers/index.js";
 
 const config: Config = {
   basePath: "data/yesimbot",
@@ -313,3 +313,180 @@ describe("Messenger segmented delivery accounting", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// R17 / item 4：`delivered.messageId` 用平台真实 id，并标明来源
+// ---------------------------------------------------------------------------
+
+describe("Messenger delivery identity", () => {
+  it("reports the platform message id and marks its source", async () => {
+    const ctx = new Context();
+    const sendMessage = vi.fn(async () => ["platform-msg-9"]);
+    ctx.bots.push({ platform: "test", selfId: "bot-1", sendMessage } as never);
+    const delivered = collector(ctx);
+    const runtime = runnable([[h.text("hi")]]);
+    const channels = { resolve: vi.fn(async () => ({ context: runtime.context })) };
+    const runtimes = { get: vi.fn(async () => runtime) };
+    const messenger = new Messenger(ctx, config, channels as never, runtimes as never);
+
+    await messenger.post(event);
+
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({
+      messageId: "platform-msg-9",
+      messageIdSource: "platform",
+      internalMessageId: "assistant-1",
+      turnId: "turn-1",
+    });
+  });
+
+  it("falls back to the internal uuid when the platform returns no id", async () => {
+    const ctx = new Context();
+    const sendMessage = vi.fn(async () => []);
+    ctx.bots.push({ platform: "test", selfId: "bot-1", sendMessage } as never);
+    const delivered = collector(ctx);
+    const runtime = runnable([[h.text("hi")]]);
+    const channels = { resolve: vi.fn(async () => ({ context: runtime.context })) };
+    const runtimes = { get: vi.fn(async () => runtime) };
+    const messenger = new Messenger(ctx, config, channels as never, runtimes as never);
+
+    await messenger.post(event);
+
+    expect(delivered[0]).toMatchObject({
+      messageId: "assistant-1",
+      messageIdSource: "internal",
+      internalMessageId: "assistant-1",
+    });
+  });
+
+  it("uses the first delivered platform id for a multi-segment card", async () => {
+    const ctx = new Context();
+    const sendMessage = vi.fn().mockResolvedValueOnce(["p-one"]).mockResolvedValueOnce(["p-two"]);
+    ctx.bots.push({ platform: "test", selfId: "bot-1", sendMessage } as never);
+    const delivered = collector(ctx);
+    const runtime = runnable([[h.text("one")], [h.text("two")]]);
+    const channels = { resolve: vi.fn(async () => ({ context: runtime.context })) };
+    const runtimes = { get: vi.fn(async () => runtime) };
+    const messenger = new Messenger(ctx, config, channels as never, runtimes as never);
+
+    await messenger.post(event);
+
+    expect(delivered[0]).toMatchObject({ messageId: "p-one", messageIdSource: "platform", text: "onetwo" });
+  });
+
+  it("keeps failure attribution on the internal uuid after a platform id is known", async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = new Context();
+      const controller = new AbortController();
+      const sendMessage = vi.fn(async () => ["p-one"]);
+      ctx.bots.push({ platform: "test", selfId: "bot-1", sendMessage } as never);
+      const delivered = collector(ctx);
+      const runtime = runnable([[h.text("one")], [h.text("two")]], controller.signal);
+      const channels = { resolve: vi.fn(async () => ({ context: runtime.context })) };
+      const runtimes = { get: vi.fn(async () => runtime) };
+      const messenger = new Messenger(ctx, { ...config, pacing: { charactersPerSecond: 1, maxTotalDelayMs: 1_000 } }, channels as never, runtimes as never);
+
+      const pending = messenger.post(event);
+      await vi.advanceTimersByTimeAsync(300);
+      controller.abort();
+      await vi.runAllTimersAsync();
+      await pending;
+
+      expect(runtime.fail).toHaveBeenCalledWith(
+        "event-1",
+        expect.objectContaining({ name: "AbortError" }),
+        { turnId: "turn-1", messageId: "assistant-1", segmentIndex: 1, segmentTotal: 2 },
+      );
+      expect(delivered[0]).toMatchObject({ messageId: "p-one", messageIdSource: "platform", internalMessageId: "assistant-1" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("extracts ids from the shapes adapters actually return", () => {
+    expect(extractPlatformMessageId("b")).toBe("b");
+    expect(extractPlatformMessageId(["a"])).toBe("a");
+    expect(extractPlatformMessageId([[{ messageId: "c" }]])).toBe("c");
+    expect(extractPlatformMessageId({ id: 42 })).toBe("42");
+    expect(extractPlatformMessageId([])).toBeUndefined();
+    expect(extractPlatformMessageId(undefined)).toBeUndefined();
+    expect(extractPlatformMessageId("   ")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R17 / item 5：准入拒绝不再静默（带平台 / 频道 / 原因 + 节流）
+// ---------------------------------------------------------------------------
+
+function shadowLogger(messenger: Messenger): { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; debug: ReturnType<typeof vi.fn> } {
+  const info = vi.fn();
+  const warn = vi.fn();
+  const debug = vi.fn();
+  (messenger as unknown as { logger: unknown }).logger = { level: 0, info, warn, debug };
+  return { info, warn, debug };
+}
+
+function routeSession(overrides: Record<string, unknown> = {}) {
+  return {
+    type: "message-created",
+    platform: "test",
+    selfId: "bot-1",
+    channelId: "guild-milky-7777",
+    guildId: "7777",
+    userId: "user-1",
+    timestamp: 1,
+    messageId: "message-1",
+    isDirect: false,
+    event: { channel: { type: 0 }, user: { id: "user-1" } },
+    elements: [h.text("hello")],
+    send: vi.fn(async () => []),
+    ...overrides,
+  };
+}
+
+describe("Messenger admission logging", () => {
+  it("logs a channel outside the allowlist once per throttle window", async () => {
+    const ctx = new Context();
+    const runtime = { handle: vi.fn(async () => ({ kind: "wait" as const, eventId: "event-1" })) };
+    const channels = { start: vi.fn(async () => undefined), resolve: vi.fn(async () => ({ context: {} })) };
+    const runtimes = { get: vi.fn(async () => runtime) };
+    const messenger = new Messenger(
+      ctx,
+      { ...config, allowedChannels: [{ platform: "test", channelId: "allowed" }] },
+      channels as never,
+      runtimes as never,
+    );
+    const logs = shadowLogger(messenger);
+
+    await messenger["handle"](routeSession() as never);
+    await messenger["handle"](routeSession({ messageId: "message-2" }) as never);
+
+    expect(channels.resolve).not.toHaveBeenCalled();
+    expect(runtimes.get).not.toHaveBeenCalled();
+    expect(logs.info).toHaveBeenCalledTimes(1);
+    expect(logs.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: "admission.not_in_allowlist",
+        platform: "test",
+        channelId: "guild-milky-7777",
+        reason: "channel_not_in_allowedChannels",
+      }),
+    );
+  });
+
+  it("warns when a session carries no resolvable channel context", async () => {
+    const ctx = new Context();
+    const channels = { start: vi.fn(async () => undefined), resolve: vi.fn(async () => ({ context: {} })) };
+    const runtimes = { get: vi.fn() };
+    const messenger = new Messenger(ctx, { ...config, allowedChannels: [{ platform: "test", channelId: "*" }] }, channels as never, runtimes as never);
+    const logs = shadowLogger(messenger);
+
+    await messenger["handle"](routeSession({ guildId: undefined }) as never);
+
+    expect(logs.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "admission.no_channel_context", platform: "test", channelId: "guild-milky-7777", reason: "missing_channel_context" }),
+    );
+    expect(runtimes.get).not.toHaveBeenCalled();
+  });
+});

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import type { ChannelContext } from "koishi-plugin-yesimbot";
@@ -25,9 +25,19 @@ export interface GlobalBrainStoreOptions {
   readonly maxDigestThreads: number;
   readonly maxDigestReplies: number;
   readonly maxBlobBytes?: number;
+  /**
+   * brain.jsonl 体积超过这个字节数时压成状态快照。默认 8 MiB；<=0 表示关闭压缩。
+   * 压缩不丢语义：每个线程只留最新一条记录，seen 按 (scope, 目标) 去重。
+   */
+  readonly compactThresholdBytes?: number;
+  /** 每追加这么多条记录检查一次体积，避免每次写都 stat。默认 200。 */
+  readonly compactCheckEvery?: number;
   readonly now?: () => number;
   readonly createId?: () => string;
-  readonly logger?: { warn(message: string, context?: Record<string, unknown>): void };
+  readonly logger?: {
+    warn(message: string, context?: Record<string, unknown>): void;
+    info?(message: string, context?: Record<string, unknown>): void;
+  };
 }
 
 export interface BrainDepositInput {
@@ -57,6 +67,8 @@ export interface GlobalBrainStore {
   status(sourceScope: ChannelContext): Promise<BrainThreadStatus[]>;
   participantScopes(): Promise<ChannelContext[]>;
   digest(scope: ChannelContext): Promise<BrainDigest>;
+  /** 立即把只增的 jsonl 压成当前状态快照（线程保留最新一条、seen 去重）。 */
+  compact(): Promise<{ readonly beforeBytes: number; readonly afterBytes: number }>;
 }
 
 interface BrainSeenRecord {
@@ -80,6 +92,9 @@ export function createGlobalBrainStore(options: GlobalBrainStoreOptions): Global
   const now = options.now ?? Date.now;
   const createId = options.createId ?? randomUUID;
   const maxBlobBytes = options.maxBlobBytes ?? 5 * 1024 * 1024;
+  const compactThresholdBytes = options.compactThresholdBytes ?? 8 * 1024 * 1024;
+  const compactCheckEvery = Math.max(1, options.compactCheckEvery ?? 200);
+  let appendedSinceCompact = 0;
   const blobDir = join(dirname(options.filePath), "blobs");
   const threads = new Map<string, BrainThread>();
   const replies = new Map<string, BrainReply[]>();
@@ -97,12 +112,82 @@ export function createGlobalBrainStore(options: GlobalBrainStoreOptions): Global
     return next;
   };
 
-  const appendRecord = (record: BrainRecord): Promise<void> => {
-    return appendFile(options.filePath, `${JSON.stringify(record)}\n`, "utf8");
-  };
-
   const warn = (message: string, context?: Record<string, unknown>): void => {
     options.logger?.warn(message, context);
+  };
+
+  const info = (message: string, context?: Record<string, unknown>): void => {
+    const sink = options.logger?.info ?? options.logger?.warn;
+    if (sink) sink.call(options.logger, message, context);
+  };
+
+  const fileSize = async (): Promise<number> => {
+    try {
+      return (await stat(options.filePath)).size;
+    } catch {
+      return 0;
+    }
+  };
+
+  /**
+   * P1-M1-3：brain.jsonl 是「追加日志」，线程状态更新（resolve）和 replay 会让
+   * 同一个 id 出现多条记录。这里把内存里的当前状态写成一份等价快照：
+   * 每个线程只留最新一条，回复全留（它们本身就是不可变增量），seen 按
+   * (scope, threadId|replyId) 去重。读回来的状态与压缩前完全一致。
+   */
+  const buildSnapshot = (): string => {
+    const at = now();
+    const lines: string[] = [];
+    for (const thread of threads.values()) {
+      lines.push(JSON.stringify({ type: "thread", data: thread }));
+    }
+    for (const list of replies.values()) {
+      for (const reply of list) lines.push(JSON.stringify({ type: "reply", data: reply }));
+    }
+    for (const [threadId, keys] of seenThreads) {
+      for (const key of keys) lines.push(JSON.stringify({ type: "seen", data: { scopeKey: key, threadId, seenAt: at } }));
+    }
+    for (const [replyId, keys] of seenReplies) {
+      for (const key of keys) lines.push(JSON.stringify({ type: "seen", data: { scopeKey: key, replyId, seenAt: at } }));
+    }
+    return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+  };
+
+  const compactNow = async (): Promise<{ readonly beforeBytes: number; readonly afterBytes: number }> => {
+    const beforeBytes = await fileSize();
+    const snapshot = buildSnapshot();
+    const temporary = `${options.filePath}.${randomUUID()}.tmp`;
+    await mkdir(dirname(options.filePath), { recursive: true });
+    await writeFile(temporary, snapshot, "utf8");
+    try {
+      await rename(temporary, options.filePath);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    const afterBytes = Buffer.byteLength(snapshot, "utf8");
+    appendedSinceCompact = 0;
+    info("global_brain.compacted", {
+      file: options.filePath,
+      beforeBytes,
+      afterBytes,
+      records: snapshot.length === 0 ? 0 : snapshot.split("\n").length - 1,
+      threads: threads.size,
+    });
+    return { beforeBytes, afterBytes };
+  };
+
+  const appendRecord = async (record: BrainRecord): Promise<void> => {
+    await appendFile(options.filePath, `${JSON.stringify(record)}\n`, "utf8");
+    appendedSinceCompact += 1;
+    if (compactThresholdBytes <= 0 || appendedSinceCompact < compactCheckEvery) return;
+    try {
+      if ((await fileSize()) >= compactThresholdBytes) await compactNow();
+      else appendedSinceCompact = 0;
+    } catch (cause) {
+      // 压缩是维护动作，失败不能拖垮写入：记一条日志，等下一轮再试。
+      appendedSinceCompact = 0;
+      warn("global_brain.compact_failed", { cause: cause instanceof Error ? cause.message : String(cause) });
+    }
   };
 
   const rememberThreadSeen = (threadId: string, key: string): void => {
@@ -183,6 +268,14 @@ export function createGlobalBrainStore(options: GlobalBrainStoreOptions): Global
       await serialize(async () => {
         await mkdir(dirname(options.filePath), { recursive: true });
         await load();
+        // 上次运行遗留的巨型日志在启动时先压一次，避免一直背着它跑。
+        if (compactThresholdBytes > 0 && (await fileSize()) >= compactThresholdBytes) {
+          try {
+            await compactNow();
+          } catch (cause) {
+            warn("global_brain.compact_failed", { cause: cause instanceof Error ? cause.message : String(cause) });
+          }
+        }
         initialized = true;
       });
     },
@@ -353,6 +446,11 @@ export function createGlobalBrainStore(options: GlobalBrainStoreOptions): Global
           replies: replyItems.map((item) => ({ thread: { ...item.thread, tags: [...item.thread.tags] }, replies: item.replies })),
         };
       });
+    },
+
+    async compact() {
+      await this.init();
+      return serialize(async () => compactNow());
     },
   };
 }

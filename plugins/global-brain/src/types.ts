@@ -58,6 +58,8 @@ export interface GlobalBrainConfig {
   readonly maxDigestReplies: number;
   readonly maxDigestContentLength: number;
   readonly maxBlobBytes: number;
+  /** brain.jsonl 超过这个体积（MB）时压成状态快照，默认 8。 */
+  readonly brainCompactThresholdMB: number;
 }
 declare module "koishi-plugin-yesimbot" {
   interface EventMap {

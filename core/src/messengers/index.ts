@@ -2,16 +2,33 @@ import type { Awaitable, Bot, Context, Element, Logger, Session } from "koishi";
 import { Universal } from "koishi";
 
 import type { Channels } from "../channels/index.js";
-import { type ChannelContext, deriveChannelKey, contextFromSession, contextFromRecord } from "../channels/index.js";
+import { AdmissionThrottle, type ChannelContext, deriveChannelKey, contextFromSession, contextFromRecord } from "../channels/index.js";
 import type { ChannelAllowRule, Config, PacingConfig } from "../config.js";
-import { formatElements } from "../messages/index.js";
+import { formatElements, setMessagesLogger } from "../messages/index.js";
 import type { DeliveredPayload, EventRecord, MessageRecord, RecordBase } from "../messages/index.js";
 import type { ChannelResources } from "../resources/index.js";
 import type { ChannelRuntime, NudgeOptions, PostOptions, RuntimeResult, Runtimes } from "../runtimes/index.js";
 
 type RunResult = Extract<RuntimeResult, { readonly kind: "run" }>;
 
-type DeliveryContext = { turnId: string; messageId: string; segmentIndex: number; segmentTotal: number };
+/**
+ * 一次投递的上下文。
+ *
+ * `messageId` 的语义被明确成「**对外可见的消息 id**」：平台在 `sendMessage` 里返回了真实
+ * id 就用它（`messageIdSource: "platform"`），拿不到才退回内部 uuid
+ * （`messageIdSource: "internal"`）。内部 uuid 永远保留在 `internalMessageId` 里，
+ * 它是 `delivery.failed` 归因与日志追踪的主键，但它**不是**平台消息 id。
+ */
+type DeliveryContext = {
+  turnId: string;
+  /** 内部 uuid：把这次投递归因到某一轮 assistant 消息 */
+  internalMessageId: string;
+  /** 平台真实 id 优先，拿不到时等于 internalMessageId */
+  messageId: string;
+  messageIdSource: "platform" | "internal";
+  segmentIndex: number;
+  segmentTotal: number;
+};
 
 /** 分段投递统计：`yesimbot/delivered` 会额外带上这些字段（DeliveredPayload 的结构化扩展）。 */
 export interface DeliveryStats {
@@ -28,6 +45,8 @@ interface DeliveryTally {
   aborted: boolean;
   reason: string;
   text: string[];
+  /** 平台返回的真实消息 id（第一段成功投递的那个）；拿不到就留空 */
+  platformMessageId?: string;
   error?: unknown;
 }
 
@@ -49,6 +68,8 @@ export class Messenger {
   private readonly sessions = new WeakSet<object>();
   private readonly tasks = new Set<Promise<unknown>>();
   private readonly deliveryTails = new Map<string, Promise<void>>();
+  /** 准入失败日志节流：同一频道同一原因 5 分钟一条，避免刷屏 */
+  private readonly admission = new AdmissionThrottle();
   private readonly disposers: Array<() => unknown> = [];
   private closed = false;
 
@@ -60,6 +81,8 @@ export class Messenger {
   ) {
     this.logger = ctx.logger("yesimbot.messenger");
     this.logger.level = config.logLevel ?? 2;
+    // parseReply 在 messages/ 里是纯函数，`}]` 残片剥离的 debug 走模块级注入
+    setMessagesLogger(ctx.logger("yesimbot.messages"));
     const middleware = ctx.middleware(async (session, next) => {
       try {
         await this.handle(session);
@@ -157,7 +180,30 @@ export class Messenger {
   private async route(session: Session): Promise<void> {
     const ctx = contextFromSession(session);
     const routeId = session.messageId ?? String(session.id);
-    if (!ctx || !matchesAllowedChannel(ctx, this.config.allowedChannels)) return;
+    if (!ctx) {
+      // 拿不到频道上下文 = 这条消息被静默丢弃（旧实现零日志，磁盘上只剩孤儿目录）
+      this.logAdmission("warn", "admission.no_channel_context", {
+        platform: session.platform,
+        channelId: session.channelId ?? "",
+        selfId: session.selfId,
+        type: session.type,
+        routeId,
+        reason: "missing_channel_context",
+      });
+      return;
+    }
+    if (!matchesAllowedChannel(ctx, this.config.allowedChannels)) {
+      // 白名单外是**预期行为**，但必须留证：guild-milky-7777 那种孤儿目录就是这么来的
+      this.logAdmission("info", "admission.not_in_allowlist", {
+        platform: ctx.platform,
+        channelId: ctx.channelId,
+        selfId: ctx.selfId,
+        type: ctx.type,
+        routeId,
+        reason: "channel_not_in_allowedChannels",
+      });
+      return;
+    }
     try {
       await this.channels.start();
       await assertAssignee(this.ctx, ctx, session.selfId);
@@ -223,7 +269,14 @@ export class Messenger {
       for await (const segment of this.pacedSegments(result, delivery, tally)) {
         tally.attempted += 1;
         try {
-          await send(segment);
+          const returned: unknown = await send(segment);
+          const platformMessageId = extractPlatformMessageId(returned);
+          if (platformMessageId) {
+            tally.platformMessageId ??= platformMessageId;
+            // 平台真实 id 是本轮对外消息的唯一权威标识
+            delivery.messageId = platformMessageId;
+            delivery.messageIdSource = "platform";
+          }
         } catch (cause) {
           tally.failed += 1;
           tally.error ??= cause;
@@ -265,6 +318,11 @@ export class Messenger {
     tally: DeliveryTally,
   ): Promise<void> {
     const ctx = runtime.context;
+    // 平台 id 优先：多段投递时用第一段成功的那个 id 代表整张卡（撤回/引用都指向它）
+    if (tally.platformMessageId) {
+      delivery.messageId = tally.platformMessageId;
+      delivery.messageIdSource = "platform";
+    }
     const stats: DeliveryStats = {
       segmentsDelivered: tally.delivered,
       segmentsFailed: tally.failed,
@@ -307,6 +365,8 @@ export class Messenger {
         type: ctx.type === "direct" ? Universal.Channel.Type.DIRECT : Universal.Channel.Type.TEXT,
       },
       messageId: delivery.messageId,
+      messageIdSource: delivery.messageIdSource,
+      internalMessageId: delivery.internalMessageId,
       turnId: delivery.turnId,
       text,
     };
@@ -347,7 +407,9 @@ export class Messenger {
           return;
         }
         delivery.turnId = output.turnId;
+        delivery.internalMessageId = output.messageId;
         delivery.messageId = output.messageId;
+        delivery.messageIdSource = "internal";
         delivery.segmentIndex = index + 1;
         delivery.segmentTotal = output.segments.length;
         yield segment;
@@ -364,7 +426,15 @@ export class Messenger {
   ): Promise<void> {
     // `delivery.failed` 事件的 error 只有 name/message，没有独立 reason 字段：把 reason 编进 message。
     const error = reason === undefined ? cause : namedError(reason, "AbortError");
-    await runtime.fail(result.eventId, error, delivery);
+    // `delivery.failed` 的 messageId 必须始终是内部 uuid：它用于把失败归因到某一轮，
+    // 不是平台消息 id（平台 id 只在 `yesimbot/delivered` 上代表「说出口的那条」）。
+    // 只传 runtime 认识的四个字段，避免把投递上下文的其他内部字段带进持久化事件。
+    await runtime.fail(result.eventId, error, {
+      turnId: delivery.turnId,
+      messageId: delivery.internalMessageId,
+      segmentIndex: delivery.segmentIndex,
+      segmentTotal: delivery.segmentTotal,
+    });
     this.warnSegment(runtime.context, "delivery.failed", {
       cause: error,
       delivery,
@@ -428,6 +498,28 @@ export class Messenger {
     }
   }
 
+  /**
+   * 准入拒绝的结构化日志（带节流）。
+   * 后果分级的理由：白名单外是**配置的预期结果**，但每次都必须可追溯（info）；
+   * 拿不到频道上下文属于异常（消息被丢且无法归档，warn）。
+   */
+  private logAdmission(
+    level: "info" | "warn",
+    code: string,
+    info: { platform: string; channelId: string; reason: string } & Record<string, unknown>,
+  ): void {
+    try {
+      const key = `${code}|${info.platform}|${info.channelId}|${info.reason}`;
+      const { allowed, suppressed } = this.admission.allow(key);
+      if (!allowed) return;
+      const payload = suppressed > 0 ? { code, ...info, suppressedSinceLastLog: suppressed } : { code, ...info };
+      if (level === "warn") this.logger.warn(payload);
+      else this.logger.info(payload);
+    } catch {
+      // 日志失败不影响准入判定
+    }
+  }
+
   private warn(code: string, cause: unknown, platform: string): void {
     try {
       this.logger.warn({ code, platform, cause: cause instanceof Error ? cause.message : String(cause) });
@@ -478,7 +570,39 @@ function namedError(reason: string, name: string): Error {
 }
 
 function emptyDeliveryContext(eventId: string): DeliveryContext {
-  return { turnId: "", messageId: eventId, segmentIndex: 0, segmentTotal: 0 };
+  return {
+    turnId: "",
+    internalMessageId: eventId,
+    messageId: eventId,
+    messageIdSource: "internal",
+    segmentIndex: 0,
+    segmentTotal: 0,
+  };
+}
+
+/**
+ * 从 `send` 的返回值里取平台消息 id。
+ * koishi 的 `bot.sendMessage` / `session.send` 返回 `string[]`；不同适配器也可能回单条
+ * 字符串或 `{ id }`。取不到就返回 undefined，让调用方退回内部 uuid。
+ */
+export function extractPlatformMessageId(value: unknown): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : undefined;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const id = extractPlatformMessageId(item);
+      if (id) return id;
+    }
+    return undefined;
+  }
+  if (value && typeof value === "object") {
+    const record = value as { id?: unknown; messageId?: unknown; message_id?: unknown };
+    for (const candidate of [record.id, record.messageId, record.message_id]) {
+      const id = extractPlatformMessageId(candidate);
+      if (id) return id;
+    }
+  }
+  return undefined;
 }
 
 function pacedDelay(segment: readonly Element[], pacing: PacingConfig, elapsed: number): number {

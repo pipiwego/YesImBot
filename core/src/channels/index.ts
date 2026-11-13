@@ -13,6 +13,52 @@ import { type ChannelContext, type ChannelKey, deriveChannelKey } from "./contex
 
 type ChannelManifest = ChannelContext & { readonly createdAt: string };
 
+/** 准入/扫描类日志的节流窗口：同一 (平台|频道|原因) 5 分钟内只放行一条。 */
+export const ADMISSION_LOG_WINDOW_MS = 5 * 60_000;
+
+/**
+ * 准入失败日志节流器。
+ *
+ * 为什么需要：白名单外/缺 channelId/manifest 损坏这三条路径原先都是直接 `return`，
+ * 一条日志都没有，磁盘上却留下 `guild-milky-7777` 这类孤儿目录 —— 消息被静默丢弃
+ * 却无从查证。加上日志后最怕刷屏（一个非白名单群每 5 秒一条），所以按
+ * (code|平台|频道|原因) 做窗口节流，并把被压掉的条数带回下一条日志。
+ */
+export class AdmissionThrottle {
+  private readonly seen = new Map<string, { at: number; suppressed: number }>();
+
+  public constructor(
+    private readonly windowMs: number = ADMISSION_LOG_WINDOW_MS,
+    private readonly limit = 500,
+  ) {}
+
+  public allow(key: string, now: number = Date.now()): { allowed: boolean; suppressed: number } {
+    const entry = this.seen.get(key);
+    if (entry && now - entry.at < this.windowMs) {
+      entry.suppressed += 1;
+      return { allowed: false, suppressed: entry.suppressed };
+    }
+    const suppressed = entry?.suppressed ?? 0;
+    if (!entry && this.seen.size >= this.limit) this.prune(now);
+    this.seen.set(key, { at: now, suppressed: 0 });
+    return { allowed: true, suppressed };
+  }
+
+  public reset(): void {
+    this.seen.clear();
+  }
+
+  public get size(): number {
+    return this.seen.size;
+  }
+
+  private prune(now: number): void {
+    for (const [key, value] of this.seen) {
+      if (now - value.at >= this.windowMs) this.seen.delete(key);
+    }
+  }
+}
+
 export interface ChannelsOptions {
   readonly basePath: string;
   readonly logLevel?: number;
@@ -52,6 +98,8 @@ export class Channels implements Resources {
   private readonly readTimeoutMs: number;
   private readonly compactConfig: ConversationCompactConfig;
   private readonly logger: Logger;
+  /** manifest 损坏日志节流：同一目录同一原因 5 分钟一条 */
+  private readonly admission = new AdmissionThrottle();
   private readonly started: Promise<void>;
 
   public constructor(ctx: Context, options: ChannelsOptions) {
@@ -136,8 +184,9 @@ export class Channels implements Resources {
         this.logger.error("storage.directory.invalid", { entry: entry.name });
         continue;
       }
+      let raw: unknown;
       try {
-        const raw = JSON.parse(await fs.readFile(join(this.channelsPath, entry.name, "channel.json"), "utf8")) as unknown;
+        raw = JSON.parse(await fs.readFile(join(this.channelsPath, entry.name, "channel.json"), "utf8")) as unknown;
         const manifest = parseManifest(raw);
         const canonical = channelDirectoryName(manifest);
 
@@ -159,8 +208,33 @@ export class Channels implements Resources {
           throw new Error("Manifest directory name does not match directory");
         }
       } catch (cause) {
-        this.logger.error("storage.manifest_invalid", { directoryName: entry.name, cause });
+        this.logManifestFailure(entry.name, raw, cause);
       }
+    }
+  }
+
+  /**
+   * manifest 坏掉的频道不会进内存表：它的历史与上下文对运维等于消失了。
+   * 旧实现只打 `{ directoryName, cause }`，`cause` 是 Error 实例 —— 序列化后是 `{}`，
+   * 于是既看不到平台/频道，也看不到真正原因，等同于静默。现在给出
+   * 「平台 + 频道 id + 可读原因」，并按目录+原因节流。
+   */
+  private logManifestFailure(directoryName: string, raw: unknown, cause: unknown): void {
+    try {
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      const scope = describeDirectoryScope(directoryName, raw);
+      const key = `storage.manifest_invalid|${scope.platform}|${scope.channelId}|${reason}`;
+      const { allowed, suppressed } = this.admission.allow(key);
+      if (!allowed) return;
+      this.logger.warn({
+        code: "storage.manifest_invalid",
+        directoryName,
+        ...scope,
+        reason,
+        ...(suppressed > 0 ? { suppressedSinceLastLog: suppressed } : {}),
+      });
+    } catch {
+      // 日志失败不能影响启动扫描
     }
   }
 
@@ -243,6 +317,40 @@ export function channelDirectoryName(ctx: ChannelContext): string {
 
 function encodeDirectorySegment(value: string): string {
   return [...value].map((char) => (/[A-Za-z0-9]/.test(char) ? char : `%${char.codePointAt(0)!.toString(16)}%`)).join("");
+}
+
+/** `encodeDirectorySegment` 的逆运算，用于从目录名反解出人类可读的 id。 */
+function decodeDirectorySegment(value: string): string {
+  try {
+    return value.replace(/%([0-9a-f]+)%/gi, (_match, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)));
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * manifest 读不出来时，尽最大努力从「原始 JSON」和「目录名」（canonical 命名
+ * `channel-<platform>-<guild>-<channel>` / `guild-<platform>-<guild>` /
+ * `direct-<platform>-<user>-<self>`）还原平台与频道，供日志定位。
+ */
+function describeDirectoryScope(directoryName: string, raw: unknown): { platform: string; type: string; channelId: string } {
+  const source = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+  const pick = (key: string): string => {
+    const value = source[key];
+    return typeof value === "string" && value.trim() ? value.trim() : "";
+  };
+  const segments = directoryName.split("-").map((segment) => decodeDirectorySegment(segment));
+  const kind = segments[0] ?? "";
+  const known = kind === "channel" || kind === "guild" || kind === "direct" || kind === "shared";
+  const type = pick("type") || kind || "unknown";
+  const platform = pick("platform") || (known ? (segments[1] ?? "") : "");
+  let channelId = pick("channelId");
+  if (!channelId) {
+    if (type === "channel") channelId = segments[3] ?? segments[2] ?? "";
+    else if (type === "guild" || type === "shared") channelId = segments[2] ?? "";
+    else if (type === "direct") channelId = segments[2] ?? "";
+  }
+  return { platform, type, channelId };
 }
 
 function legacyDirectoryNames(raw: unknown, manifest: ChannelManifest): string[] {

@@ -24,12 +24,14 @@ import {
   createGlobalRuleStore,
   kindsOf,
   mergeLocalPatterns,
+  revokeBoundaries,
   selectBoundaries,
   selectGlobalChains,
   selectGlobalMemeTemplates,
   selectGlobalPatterns,
   selectRelevantGlobalChains,
   type GlobalRuleStore,
+  type RevokeBoundaryOptions,
 } from "./global-store.js";
 import { createChatHistoryStore, type ChatHistoryStore } from "./history.js";
 import { buildLinks } from "./links.js";
@@ -452,7 +454,7 @@ export default class ChatLearningPlugin {
           const reference = buildReferenceBlock();
           if (reference) {
             try {
-              next = await rewriteAssistantEntries(next, ctx.yesimbot.model.resolveChatModel(finalStyleModelId).model, reference);
+              next = await rewriteAssistantEntries(next, ctx.yesimbot.model.resolveChatModel(finalStyleModelId).model, reference, { logger });
               logger.debug("chat_learning.final_style_rewritten", { scope, entries: next.length });
             } catch (cause) {
               logger.warn("chat_learning.final_style_rewrite_failed", { scope, cause: cause instanceof Error ? cause.message : String(cause) });
@@ -894,6 +896,40 @@ export default class ChatLearningPlugin {
           });
           this.logger.debug("chat_learning.reflection_annotated", { scope, id: record.id, score: record.score });
           return `已保存人工反思 ${record.id}`;
+        }),
+    );
+
+    track(
+      this.ctx
+        .command("yesimbot.chat-learning.revoke <target>", "撤销一条跨群边界记忆（id 或原文）", { authority: 4 })
+        .option("global", "跨频道撤销同一条边界（默认只撤当前频道）")
+        .action(async ({ session, options }, target) => {
+          const scope = scopeOf(session);
+          if (!scope) return "无法获取当前频道信息";
+          const raw = typeof target === "string" ? target.trim() : "";
+          if (raw.length === 0) return "用法：yesimbot.chat-learning.revoke <边界 id 或原文> [--global]";
+          const storagePath = (await this.ctx.yesimbot.resource.get(scope)).path;
+          const { store, path } = await this.globalStoreFor(storagePath);
+          const byId = /^[a-f0-9]{16}$/.test(raw);
+          const options_: RevokeBoundaryOptions = {
+            ...(byId ? { id: raw } : { text: raw }),
+            ...(options?.global ? {} : { channelKey: boundaryChannelKey(scopeKey(scope)) }),
+            now: Date.now(),
+          };
+          const current = this.globalBanks.get(path) ?? store.read();
+          if (revokeBoundaries(current, options_).revoked.length === 0) {
+            return "没找到匹配的边界（用 yesimbot.chat-learning.global 查 id 与原文；默认只撤当前频道，跨频道加 --global）";
+          }
+          let revoked: readonly string[] = [];
+          const next = await store.updateWith((bank) => {
+            const result = revokeBoundaries(bank, options_);
+            revoked = result.revoked;
+            return result.bank;
+          });
+          this.globalBanks.set(path, next);
+          this.rebuildHooks.get(scopeKey(scope))?.();
+          this.logger.debug("chat_learning.boundary_revoked", { scope, path, ids: revoked, global: Boolean(options?.global) });
+          return `已撤销 ${revoked.length} 条边界：${revoked.join(", ")}`;
         }),
     );
   }

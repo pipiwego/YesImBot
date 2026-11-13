@@ -72,6 +72,20 @@ export type PostOptions = { readonly trigger?: boolean; readonly ifBusy?: "defer
 
 export type NudgeOptions = { readonly ifBusy?: "defer" | "join" | "reject"; readonly nudgeHint?: string };
 
+/**
+ * 已装填、尚未被任何 turn 消费的 nudge 指令。
+ *
+ * 必须带时间戳与来源 eventId：
+ *  - `at` 用于消费时的 TTL 判定 —— turn 可能在首次 prepareStep 之前就结束
+ *    （provider 报错 / turn.aborted / turn.abandoned / AgentBusyError 重排），
+ *    指令会留在字段里，之后任意一轮都会取走它；
+ *  - `eventId` 用于日志定位「这条过期指令当初是为哪条消息装的」。
+ */
+type ArmedNudgeHint = { readonly hint: string; readonly at: number; readonly eventId: string };
+
+/** nudge 指令从装填到被消费的最大存活时间；超过即视为过期并丢弃。 */
+const NUDGE_HINT_TTL_MS = 90_000;
+
 export interface ChannelRuntimeOptions {
   readonly channel: Channel;
   readonly bot: Bot;
@@ -129,7 +143,8 @@ export class ChannelRuntime {
 
   private persona = "";
   private lastPersistedInput: Message | Event | undefined;
-  private pendingNudgeHint: string | undefined;
+  /** 装填待消费的 nudge 指令（带时间戳，跨轮安全靠它 + TTL） */
+  private pendingNudgeHint: ArmedNudgeHint | undefined;
   private readonly nudgeHintsByTurn = new Map<string, string>();
 
   public constructor(
@@ -195,12 +210,7 @@ export class ChannelRuntime {
           name: "core.nudge-hint-pre",
           enforce: "pre",
           prepareStep: (messages, ctx) => {
-            if (this.pendingNudgeHint !== undefined && !this.nudgeHintsByTurn.has(ctx.turnId)) {
-              const h = this.pendingNudgeHint.trim();
-              this.pendingNudgeHint = undefined;
-              if (h) this.nudgeHintsByTurn.set(ctx.turnId, h);
-            }
-            const hint = this.nudgeHintsByTurn.get(ctx.turnId);
+            const hint = this.takeNudgeHint(ctx.turnId);
             if (!hint) return messages;
             const tag = hint.startsWith("<nudge_hint") ? hint : `<nudge_hint>\n${hint}\n</nudge_hint>`;
             return [...messages, { role: "user", content: tag }];
@@ -211,12 +221,7 @@ export class ChannelRuntime {
           name: "core.nudge-hint",
           enforce: "post",
           prepareStep: (messages, ctx) => {
-            if (this.pendingNudgeHint !== undefined && !this.nudgeHintsByTurn.has(ctx.turnId)) {
-              const h = this.pendingNudgeHint.trim();
-              this.pendingNudgeHint = undefined;
-              if (h) this.nudgeHintsByTurn.set(ctx.turnId, h);
-            }
-            const hint = this.nudgeHintsByTurn.get(ctx.turnId);
+            const hint = this.takeNudgeHint(ctx.turnId);
             if (!hint) return messages;
             const tag = hint.startsWith("<nudge_hint") ? hint : `<nudge_hint>\n${hint}\n</nudge_hint>`;
             const already = messages.some(
@@ -272,21 +277,68 @@ export class ChannelRuntime {
     return this.schedule("nudge", async () => {
       const ifBusy = options?.ifBusy ?? "reject";
       if (this.stopped || !this.lastPersistedInput) {
+        // 早退：这条 nudge 不会产生 turn，上一轮装填但没被消费的指令也不能留到下一轮
+        this.dropPendingNudgeHint(this.stopped ? "stopped" : "no-input");
         return { kind: "wait" as const, eventId: "" };
       }
       if (ifBusy === "reject" && this.agent.getActiveTurnId() !== null) {
+        // 早退：turn 还在跑，谁都不会消费这条指令 —— 连同旧的待消费指令一起丢掉
+        this.dropPendingNudgeHint("busy");
         return { kind: "wait" as const, eventId: "" };
       }
-      this.pendingNudgeHint = options?.nudgeHint;
+      const hint = options?.nudgeHint;
+      if (hint === undefined) {
+        // 调用方明确不带 hint：语义是「清掉之前那条」，不能让旧指令继续等下一个 turn
+        this.dropPendingNudgeHint("superseded");
+      } else {
+        this.pendingNudgeHint = { hint, at: Date.now(), eventId: this.lastPersistedInput.id };
+      }
       const result = this.start(this.lastPersistedInput, true, ifBusy);
       this.logger.debug("runtime.nudge", {
         eventId: this.lastPersistedInput.id,
         ifBusy,
-        hasHint: Boolean(options?.nudgeHint),
+        hasHint: Boolean(hint),
         result: result.kind,
       });
       return result;
     });
+  }
+
+  /**
+   * nudge 指令的唯一消费点：把待消费指令挂到当前 turn 上，并做 TTL 校验。
+   *
+   * 之所以必须校验 TTL：装填之后、被消费之前的那段时间里 turn 可能已经结束
+   * （provider 报错 / abort / abandoned），指令会原封不动留到下一轮。
+   * 注入一条带过期 data-target-id 与过期 gate 的指令比不注入更糟。
+   */
+  private takeNudgeHint(turnId: string): string | undefined {
+    if (this.pendingNudgeHint !== undefined && !this.nudgeHintsByTurn.has(turnId)) {
+      const armed = this.pendingNudgeHint;
+      this.pendingNudgeHint = undefined;
+      const ageMs = Date.now() - armed.at;
+      if (ageMs > NUDGE_HINT_TTL_MS) {
+        this.logger.info("nudge.hint_expired", { turnId, eventId: armed.eventId, ageMs, ttlMs: NUDGE_HINT_TTL_MS });
+      } else {
+        const hint = armed.hint.trim();
+        if (hint) this.nudgeHintsByTurn.set(turnId, hint);
+      }
+    }
+    return this.nudgeHintsByTurn.get(turnId);
+  }
+
+  /** 丢弃尚未被消费的 nudge 指令（早退 / 被替换），并留下可查的原因。 */
+  private dropPendingNudgeHint(reason: string): void {
+    const armed = this.pendingNudgeHint;
+    if (armed === undefined) return;
+    this.pendingNudgeHint = undefined;
+    this.logger.info("nudge.hint_dropped", { reason, eventId: armed.eventId, ageMs: Date.now() - armed.at });
+  }
+
+  /** 清空「已挂到某个 turn 上」的指令（stop / abort / abandoned），并留下可查的原因。 */
+  private clearNudgeHints(reason: string): void {
+    if (this.nudgeHintsByTurn.size === 0) return;
+    this.logger.info("nudge.hints_cleared", { reason, turnIds: [...this.nudgeHintsByTurn.keys()] });
+    this.nudgeHintsByTurn.clear();
   }
 
   public fail(eventId: string, cause: unknown, delivery?: { turnId: string; messageId: string; segmentIndex: number; segmentTotal: number }): Promise<void> {
@@ -448,6 +500,10 @@ export class ChannelRuntime {
     if (this.stopTask) return this.stopTask;
     this.stopped = true;
     this.clearIdleTimer();
+    // 停机：待消费的与已登记到 turn 上的 nudge 指令都已失去意义，
+    // 留着只会在（重建后的）下一轮注入一条过期指令。
+    this.dropPendingNudgeHint("stop");
+    this.clearNudgeHints("stop");
     for (const controller of this.controllers) controller.abort();
     this.stopTask = this.stopInternal();
     return this.stopTask;
@@ -600,11 +656,14 @@ export class ChannelRuntime {
         }
         if (event.type === "turn.aborted") {
           this.logger.warn("runtime.turn.aborted", { turnId: event.turnId, reason: event.reason });
+          // 被中断的 turn 不会再跑 prepareStep：把挂在它上面的指令一起清掉，别留给下一轮
+          this.clearNudgeHints("abort");
           throw new Error("Agent turn aborted");
         }
         if (event.type === "turn.abandoned") {
           // interrupt 已放弃跟踪这个 turn：不要再等它，直接收尾消费者，
           // 否则 output 永不 close、streams 永不清空、投递锁也跟着一起挂住。
+          this.clearNudgeHints("abandoned");
           this.logger.warn("runtime.turn.abandoned", {
             turnId: event.turnId,
             elapsedMs: event.elapsedMs,

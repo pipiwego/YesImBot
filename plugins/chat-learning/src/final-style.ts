@@ -40,8 +40,23 @@ export function buildFinalStylePrompt(styleReference: string, replyText: string)
   };
 }
 
+/** 改写是「锦上添花」：超时/失败必须退回原文，绝不能把回复卡住或吞掉。 */
+const DEFAULT_REWRITE_TIMEOUT_MS = 15_000;
+const DEFAULT_REWRITE_MAX_OUTPUT_TOKENS = 400;
+
+export interface FinalStyleRewriteOptions {
+  readonly timeoutMs?: number;
+  readonly maxOutputTokens?: number;
+  readonly logger?: { warn(message: string, context?: Record<string, unknown>): void };
+}
+
 // Runs before persistence and delivery, so reflection evaluates the same text users receive.
-export async function rewriteAssistantEntries(entries: readonly AgentEntry[], model: LanguageModel, styleReference: string): Promise<AgentEntry[]> {
+export async function rewriteAssistantEntries(
+  entries: readonly AgentEntry[],
+  model: LanguageModel,
+  styleReference: string,
+  options: FinalStyleRewriteOptions = {},
+): Promise<AgentEntry[]> {
   if (styleReference.trim().length === 0) return [...entries];
 
   const rewritten: AgentEntry[] = [];
@@ -53,7 +68,7 @@ export async function rewriteAssistantEntries(entries: readonly AgentEntry[], mo
 
     const original = entry.data;
     const replyText = renderAssistantText(original.content);
-    const nextText = await rewriteFinalReply(model, styleReference, replyText);
+    const nextText = await rewriteFinalReply(model, styleReference, replyText, options);
     if (!nextText || nextText === replyText) {
       rewritten.push(entry);
       continue;
@@ -73,16 +88,39 @@ export async function rewriteAssistantEntries(entries: readonly AgentEntry[], mo
   return rewritten;
 }
 
-async function rewriteFinalReply(model: LanguageModel, styleReference: string, replyText: string): Promise<string | undefined> {
+async function rewriteFinalReply(
+  model: LanguageModel,
+  styleReference: string,
+  replyText: string,
+  options: FinalStyleRewriteOptions = {},
+): Promise<string | undefined> {
   if (replyText.trim().length === 0) return undefined;
   const { system, prompt } = buildFinalStylePrompt(styleReference, replyText);
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REWRITE_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const { text } = await generateText({ model, system, prompt, temperature: 0.4 });
+    const { text } = await generateText({
+      model,
+      system,
+      prompt,
+      temperature: 0.4,
+      maxOutputTokens: options.maxOutputTokens ?? DEFAULT_REWRITE_MAX_OUTPUT_TOKENS,
+      abortSignal: controller.signal,
+    });
     const rewritten = normalizeModelOutput(text);
     return rewritten.length > 0 ? rewritten : undefined;
-  } catch {
+  } catch (cause) {
+    // 超时或失败：跳过改写，调用方原样发送原文。
+    options.logger?.warn("chat_learning.final_style_skipped", {
+      reason: controller.signal.aborted ? "timeout" : "error",
+      timeoutMs,
+      cause: cause instanceof Error ? cause.message : String(cause),
+    });
     return undefined;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

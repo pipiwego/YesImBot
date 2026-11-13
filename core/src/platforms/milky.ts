@@ -1,6 +1,7 @@
-import type { Context, Session } from "koishi";
+import type { Context, Logger, Session } from "koishi";
 import { Universal } from "koishi";
 
+import { AdmissionThrottle } from "../channels/index.js";
 import { assembleEvent, type EventRecord, type MessageRecord, type RecordBase } from "../messages/index.js";
 import type { Translator } from "../messengers/index.js";
 import type { ChannelResources } from "../resources/index.js";
@@ -32,19 +33,53 @@ declare module "../messages/index.js" {
 export class MilkyTranslator implements Translator {
   public readonly platform = "milky";
 
-  public constructor(private readonly ctx: Context) {}
+  private readonly logger: Logger;
+  /** 缺 channelId 的日志节流：同一平台同一原因 5 分钟一条 */
+  private readonly admission = new AdmissionThrottle();
+
+  public constructor(private readonly ctx: Context) {
+    this.logger = ctx.logger("yesimbot.milky");
+  }
 
   public async translate(
     session: Session,
     resources: ChannelResources,
   ): Promise<MessageRecord | EventRecord | null> {
     const base = recordBase(session);
-    if (!base) return null;
+    if (!base) {
+      // 旧实现直接 return null：这条会话连频道都归不了档，等于凭空消失
+      this.logAdmission(session);
+      return null;
+    }
 
     const event = translateMilkyEvent(base, session);
     if (event) return event;
 
     return translateOneBotMessage(this.ctx, base, session, resources);
+  }
+
+  /**
+   * 「缺 channelId」按 info 记：好友申请、部分 notice 本来就没有频道，
+   * 频繁出现说明适配器字段变了，而不是每条都是事故。
+   */
+  private logAdmission(session: Session): void {
+    try {
+      const reason = session.channelId ? "unknown_record_base_failure" : "missing_channel_id";
+      const key = `admission.milky_no_channel|${session.platform}|${session.channelId ?? ""}|${reason}`;
+      const { allowed, suppressed } = this.admission.allow(key);
+      if (!allowed) return;
+      this.logger.info({
+        code: "admission.milky_no_channel",
+        platform: session.platform,
+        channelId: session.channelId ?? "",
+        selfId: session.selfId,
+        type: session.type,
+        reason,
+        ...(suppressed > 0 ? { suppressedSinceLastLog: suppressed } : {}),
+      });
+    } catch {
+      // 日志失败不影响消息翻译
+    }
   }
 }
 
