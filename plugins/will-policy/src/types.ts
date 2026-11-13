@@ -36,10 +36,42 @@ export interface PolicyWillingnessConfig {
   readonly directForce: boolean;
 }
 
+export interface SmartBatchPreset {
+  readonly minBatchSize: number;
+  readonly maxBatchSize: number;
+  readonly debounceSeconds: number;
+  readonly maxWaitSeconds: number;
+  readonly cooldownSeconds: number;
+  readonly longSilenceMinutes: number;
+}
+
+export interface ChannelPresetOverride {
+  readonly channelId: string;
+  readonly preset: "small" | "large";
+}
+
+export interface PolicySmartBatchConfig {
+  readonly baseURL: string;
+  readonly apiKey: string;
+  readonly model: string;
+  readonly reasoningEffort: "none" | "low";
+  readonly scoreThreshold: number;
+  readonly directForce: boolean;
+  readonly mentionForce: boolean;
+  readonly quoteForce: boolean;
+  readonly pokeForce: boolean;
+  readonly forceKeywords: string[];
+  readonly defaultPreset: "small" | "large";
+  readonly smallPreset: SmartBatchPreset;
+  readonly largePreset: SmartBatchPreset;
+  readonly channelOverrides: ChannelPresetOverride[];
+}
+
 export interface WillPolicyConfig {
-  readonly engine: "routing" | "willingness";
+  readonly engine: "routing" | "willingness" | "smart-batch";
   readonly routing?: PolicyRoutingConfig;
   readonly willingness?: PolicyWillingnessConfig;
+  readonly smartBatch?: Partial<PolicySmartBatchConfig>;
   readonly priority?: number;
 }
 
@@ -71,5 +103,38 @@ export function defaultWillingnessConfig(): PolicyWillingnessConfig {
     mentionForce: false,
     quoteForce: false,
     directForce: false,
+  };
+}
+
+export function defaultSmartBatchConfig(): PolicySmartBatchConfig {
+  return {
+    baseURL: "https://api.deepseek.com/v1",
+    apiKey: process.env.DEEPSEEK_API_KEY ?? "",
+    model: "deepseek-flash",
+    reasoningEffort: "none",
+    scoreThreshold: 6,
+    directForce: true,
+    mentionForce: true,
+    quoteForce: true,
+    pokeForce: true,
+    forceKeywords: ["诗音", "诗音酱", "月见", "月见诗音", "Shion", "shion"],
+    defaultPreset: "small",
+    smallPreset: {
+      minBatchSize: 1,
+      maxBatchSize: 5,
+      debounceSeconds: 3,
+      maxWaitSeconds: 8,
+      cooldownSeconds: 12,
+      longSilenceMinutes: 20,
+    },
+    largePreset: {
+      minBatchSize: 6,
+      maxBatchSize: 18,
+      debounceSeconds: 6,
+      maxWaitSeconds: 25,
+      cooldownSeconds: 60,
+      longSilenceMinutes: 60,
+    },
+    channelOverrides: [],
   };
 }

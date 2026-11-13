@@ -1,0 +1,388 @@
+import type { TurnResult } from "@yesimbot/agent-runtime";
+import type { Element, Logger } from "koishi";
+import { isMessage, type ChannelContext, type Event, type Message, type NudgeOptions, type WillEngine, type WillState } from "koishi-plugin-yesimbot";
+
+import { DeepSeekJudge } from "./deepseek-judge.js";
+import { hasQuote, mentionKind } from "./message-context.js";
+import type { PolicySmartBatchConfig, SmartBatchPreset } from "./types.js";
+
+interface PendingMessageItem {
+  readonly shortId: string;
+  readonly realMsgId: string;
+  readonly compactLine: string;
+  readonly cleanText: string;
+  readonly isNoiseRepeat: boolean;
+}
+
+export class PolicySmartBatchEngine implements WillEngine {
+  private readonly judge: DeepSeekJudge;
+  private readonly preset: SmartBatchPreset;
+  private readonly scopeKey: string;
+  private pendingItems: PendingMessageItem[] = [];
+  private msgSeq = 0;
+  private effectiveCount = 0;
+  private effectiveMinBatch = 1;
+  private lastMessageAt: number | null = null;
+  private cooldownUntil = 0;
+  private debounceTimer: NodeJS.Timeout | undefined;
+  private maxWaitTimer: NodeJS.Timeout | undefined;
+  private cooldownTimer: NodeJS.Timeout | undefined;
+  private recentTexts: string[] = [];
+  private recentBotMsgIds = new Set<string>();
+  private lastBotReplyAt = 0;
+  private lastBotActiveUserId = "";
+  private stopped = false;
+  private evaluating = false;
+
+  public constructor(
+    private readonly scope: ChannelContext,
+    private readonly config: PolicySmartBatchConfig,
+    private readonly logger: Logger,
+    private readonly nudgeFn: (options?: NudgeOptions) => Promise<boolean>,
+    private readonly onBotDelivered?: (cb: (msgId: string, text?: string) => void) => () => void,
+  ) {
+    this.scopeKey = `${scope.platform}:${scope.channelId}`;
+    this.preset = this.resolvePreset();
+    this.effectiveMinBatch = this.preset.minBatchSize;
+    this.judge = new DeepSeekJudge(this.scopeKey, {
+      baseURL: config.baseURL,
+      apiKey: config.apiKey,
+      model: config.model,
+      reasoningEffort: config.reasoningEffort,
+    });
+    if (this.onBotDelivered) {
+      this.disposeDelivered = this.onBotDelivered((msgId, text) => {
+        this.lastBotReplyAt = Date.now();
+        if (text && text.trim()) {
+          const cleanBot = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+          if (cleanBot) {
+            this.judge.recordSilentBatch([`[诗音(我)]: ${cleanBot}`], "bot_reply");
+          }
+        }
+        if (!msgId) return;
+        this.recentBotMsgIds.add(msgId);
+        if (this.recentBotMsgIds.size > 50) {
+          const first = this.recentBotMsgIds.values().next().value;
+          if (first !== undefined) this.recentBotMsgIds.delete(first);
+        }
+      });
+    }
+  }
+
+  private disposeDelivered?: () => void;
+
+  private resolvePreset(): SmartBatchPreset {
+    const override = this.config.channelOverrides?.find((o) => o.channelId === this.scope.channelId);
+    const kind = override?.preset ?? this.config.defaultPreset ?? "small";
+    return kind === "large" ? this.config.largePreset : this.config.smallPreset;
+  }
+
+  public stop(): void {
+    this.stopped = true;
+    this.clearTimers();
+    this.disposeDelivered?.();
+    this.disposeDelivered = undefined;
+  }
+
+  private clearTimers(): void {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = undefined;
+    }
+    if (this.maxWaitTimer) {
+      clearTimeout(this.maxWaitTimer);
+      this.maxWaitTimer = undefined;
+    }
+    if (this.cooldownTimer) {
+      clearTimeout(this.cooldownTimer);
+      this.cooldownTimer = undefined;
+    }
+  }
+
+  public async observe(_result: TurnResult): Promise<void> {
+    this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + this.preset.cooldownSeconds * 1000);
+  }
+
+  public async decide(input: Message | Event, state: WillState): Promise<"wait" | "trigger"> {
+    if (this.stopped) return "wait";
+
+    // L0-A: 私聊 VIP 直通
+    if (this.scope.type === "direct" || this.scope.channelId.startsWith("private:")) {
+      if (this.config.directForce && isMessage(input)) {
+        return "trigger";
+      }
+    }
+
+    // 处理拍一拍事件
+    if (!isMessage(input)) {
+      if (this.config.pokeForce && isPokeToSelf(input)) {
+        this.flushPendingAsSilent("vip_poke");
+        this.cooldownUntil = Date.now() + this.preset.cooldownSeconds * 1000;
+        return "trigger";
+      }
+      return "wait";
+    }
+
+    const now = Date.now();
+    const silenceMs = this.lastMessageAt === null ? Infinity : now - this.lastMessageAt;
+    const isColdStart = silenceMs >= this.preset.longSilenceMinutes * 60_000;
+    this.lastMessageAt = now;
+
+    const item = this.buildItem(input);
+
+    // L0-B: 群聊强唤醒 (@self / 引用诗音 / 命中唤醒词 / 刚跟诗音对话 45s 内的同人追问)
+    const isFollowUpWindow =
+      now - this.lastBotReplyAt <= 45_000 &&
+      input.data.user.id === this.lastBotActiveUserId &&
+      !input.data.elements?.some((el) => el.type === "at" && String(el.attrs?.id ?? "") !== "" && String(el.attrs?.id ?? "") !== input.data.selfId);
+    if (this.isVipMessage(input, item.cleanText) || isFollowUpWindow) {
+      this.lastBotActiveUserId = input.data.user.id;
+      this.lastBotReplyAt = now;
+      this.pendingItems.push(item);
+      this.flushPendingAsSilent(isFollowUpWindow ? "vip_followup" : "vip_direct");
+      this.cooldownUntil = now + (isFollowUpWindow ? 4_000 : this.preset.cooldownSeconds * 1000);
+      this.logger.debug("smart_batch.vip_trigger", {
+        channelId: this.scope.channelId,
+        messageId: input.data.messageId,
+        isFollowUpWindow,
+      });
+      return "trigger";
+    }
+
+    // 记入蓄水池
+    if (this.pendingItems.length === 0) {
+      this.effectiveMinBatch = isColdStart ? 1 : this.preset.minBatchSize;
+    }
+    this.pendingItems.push(item);
+    if (!item.isNoiseRepeat) {
+      this.effectiveCount++;
+    }
+
+    // 硬冷却锁或正在回复中：只静默记入背景，待冷却结束后评估剩余新消息
+    if (state.activeTurnId !== null || now < this.cooldownUntil) {
+      this.scheduleCooldownFlush(now);
+      return "wait";
+    }
+
+    // 攒满 maxBatchSize 立即触发评估
+    if (this.pendingItems.length >= this.preset.maxBatchSize) {
+      this.clearTimers();
+      void this.flushAndEvaluate("max_batch");
+      return "wait";
+    }
+
+    // 若不是无意义复读，则设置/重置防抖定时器
+    if (!item.isNoiseRepeat) {
+      if (this.debounceTimer) clearTimeout(this.debounceTimer);
+      this.debounceTimer = setTimeout(() => {
+        this.debounceTimer = undefined;
+        void this.flushAndEvaluate("debounce");
+      }, this.preset.debounceSeconds * 1000);
+    }
+
+    if (!this.maxWaitTimer) {
+      this.maxWaitTimer = setTimeout(() => {
+        this.maxWaitTimer = undefined;
+        void this.flushAndEvaluate("max_wait");
+      }, this.preset.maxWaitSeconds * 1000);
+    }
+
+    return "wait";
+  }
+
+  private scheduleCooldownFlush(now: number): void {
+    if (this.cooldownTimer || this.stopped) return;
+    const waitMs = Math.max(500, this.cooldownUntil - now + 200);
+    this.cooldownTimer = setTimeout(() => {
+      this.cooldownTimer = undefined;
+      if (this.stopped || this.pendingItems.length === 0) return;
+      void this.flushAndEvaluate("after_cooldown");
+    }, waitMs);
+  }
+
+  private flushPendingAsSilent(reason: string): void {
+    this.clearTimers();
+    if (this.pendingItems.length === 0) return;
+    const lines = this.pendingItems.map((i) => i.compactLine);
+    this.pendingItems = [];
+    this.effectiveCount = 0;
+    this.effectiveMinBatch = this.preset.minBatchSize;
+    this.judge.recordSilentBatch(lines, reason);
+  }
+
+  private async flushAndEvaluate(reason: string): Promise<void> {
+    if (this.stopped || this.evaluating || this.pendingItems.length === 0) return;
+    this.clearTimers();
+
+    const batch = this.pendingItems.splice(0, this.pendingItems.length);
+    const effCount = this.effectiveCount;
+    const reqMin = this.effectiveMinBatch;
+    this.effectiveCount = 0;
+    this.effectiveMinBatch = this.preset.minBatchSize;
+
+    const lines = batch.map((b) => b.compactLine);
+
+    // 若到期时有效水位仍不足 effectiveMinBatch（例如大群零星 1~2 句后冷场或纯复读），静默归档不调 API
+    if (effCount < reqMin) {
+      this.judge.recordSilentBatch(lines, "low_water");
+      this.logger.debug("smart_batch.silent_archive", {
+        channelId: this.scope.channelId,
+        reason,
+        effCount,
+        reqMin,
+      });
+      return;
+    }
+
+    this.evaluating = true;
+    try {
+      const decision = await this.judge.evaluate(lines);
+      this.logger.info("smart_batch.judge", {
+        channelId: this.scope.channelId,
+        reason,
+        batchSize: batch.length,
+        a: decision.a,
+        s: decision.s,
+        id: decision.id,
+        g: decision.g,
+        m: decision.m,
+        h: decision.h,
+        latencyMs: decision.latencyMs,
+        cacheHit: decision.cacheHitTokens,
+        cacheMiss: decision.cacheMissTokens,
+      });
+
+      if (this.stopped) return;
+
+      if (decision.a === 1 && decision.s >= this.config.scoreThreshold) {
+        const matched = batch.find((b) => b.shortId === decision.id) ?? batch.at(-1)!;
+        const targetRealMsgId = matched.realMsgId;
+        const gateName = decision.g === 1 ? "comfort" : decision.g === 2 ? "work_delivery" : "casual";
+        const moveName = decision.m || "random_chat";
+        const hookText = decision.h || "自然接话";
+        const nudgeHint = `<nudge_hint data-gate="${gateName}" data-move="${moveName}" data-target-id="${targetRealMsgId}">\n[潜意识切入参考] 可自然接话消息 id=${targetRealMsgId}（切入点：${hookText}），按平时短句风格随口接一句即可。\n</nudge_hint>`;
+
+        this.cooldownUntil = Date.now() + this.preset.cooldownSeconds * 1000;
+        this.lastBotReplyAt = Date.now();
+        const nudged = await this.nudgeFn({ ifBusy: "reject", nudgeHint });
+        this.logger.info("smart_batch.nudged", {
+          channelId: this.scope.channelId,
+          targetRealMsgId,
+          gateName,
+          moveName,
+          hookText,
+          nudged,
+        });
+      }
+    } finally {
+      this.evaluating = false;
+    }
+  }
+
+  private buildItem(input: Message): PendingMessageItem {
+    this.msgSeq = (this.msgSeq % 99) + 1;
+    const shortId = `m${this.msgSeq}`;
+    const realMsgId = input.data.messageId;
+    const sender = (input.data.user.name || input.data.user.id || "群友").slice(0, 12);
+    const { compact, clean } = compactElements(input.data.elements);
+
+    const norm = clean.toLowerCase().trim();
+    const isShort = norm.length <= 12;
+    const repeatCount = norm ? this.recentTexts.filter((t) => t === norm).length : 0;
+    const isNoiseRepeat = isShort && repeatCount >= 2; // 含当前第 3 条及以上相同短文本
+
+    if (norm) {
+      this.recentTexts.push(norm);
+      if (this.recentTexts.length > 8) this.recentTexts.shift();
+    }
+
+    const compactLine = `[${shortId}] ${sender}: ${compact || "[空]"}`;
+    return {
+      shortId,
+      realMsgId,
+      compactLine,
+      cleanText: clean,
+      isNoiseRepeat,
+    };
+  }
+
+  private isVipMessage(input: Message, cleanText: string): boolean {
+    const { selfId, elements } = input.data;
+    if (this.config.mentionForce && mentionKind(selfId, elements) === "self") {
+      return true;
+    }
+    if (this.config.quoteForce && hasQuoteToSelf(selfId, elements, this.recentBotMsgIds)) {
+      return true;
+    }
+    if (this.config.forceKeywords.length > 0 && cleanText) {
+      const lower = cleanText.toLowerCase();
+      for (const kw of this.config.forceKeywords) {
+        if (kw && lower.includes(kw.toLowerCase())) return true;
+      }
+    }
+    return false;
+  }
+}
+
+function hasQuoteToSelf(selfId: string, elements: readonly Element[] | undefined, recentBotMsgIds: Set<string>): boolean {
+  if (!hasQuote(elements)) return false;
+  for (const el of elements ?? []) {
+    if (el.type !== "quote" && el.type !== "reply") continue;
+    const attrs = el.attrs ?? {};
+    const uid = String(attrs.userId ?? (attrs.user as { id?: unknown } | undefined)?.id ?? attrs.authorId ?? "");
+    if (uid && uid === selfId) return true;
+    const qId = String(attrs.id ?? attrs.messageId ?? "");
+    if (qId && recentBotMsgIds.has(qId)) return true;
+    for (const child of el.children ?? []) {
+      if (child.type === "author" && String(child.attrs?.id ?? child.attrs?.userId ?? "") === selfId) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isPokeToSelf(input: Event): boolean {
+  if (input.role !== "custom" || input.type !== "yesimbot.event") return false;
+  const data = input.data as Record<string, unknown>;
+  if (data.eventType !== "notice.poke") return false;
+  const targetId = String(data.targetId ?? data.userId ?? "");
+  if (targetId && targetId !== String(data.selfId ?? "")) {
+    return false;
+  }
+  return true;
+}
+
+function compactElements(elements: readonly Element[] | undefined): { compact: string; clean: string } {
+  if (!elements || elements.length === 0) return { compact: "", clean: "" };
+  const parts: string[] = [];
+  const cleanParts: string[] = [];
+  for (const el of elements) {
+    if (el.type === "text") {
+      const c = String(el.attrs?.content ?? "")
+        .replace(/https?:\/\/\S+/gi, "[链接]")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (c) {
+        parts.push(c);
+        cleanParts.push(c);
+      }
+    } else if (el.type === "img" || el.type === "image") {
+      parts.push("[图]");
+    } else if (el.type === "face" || el.type === "mface" || el.type === "sticker") {
+      parts.push("[表情]");
+    } else if (el.type === "at") {
+      const name = String(el.attrs?.name ?? el.attrs?.id ?? "某人");
+      parts.push(`@${name}`);
+    } else if (el.type === "quote" || el.type === "reply") {
+      parts.push("[引用]");
+    } else if (el.type === "file") {
+      const title = String(el.attrs?.title ?? el.attrs?.name ?? "文件");
+      parts.push(`[文件:${title}]`);
+      cleanParts.push(`[文件:${title}]`);
+    }
+  }
+  const compact = parts.join(" ").trim().slice(0, 80);
+  const clean = cleanParts.join(" ").trim().slice(0, 120);
+  return { compact, clean };
+}
