@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { StyleCorpusRetriever, stripMediaPlaceholders, buildSafeFtsTrigramQuery } from "./style-corpus.js";
+import { spiceHint, observeReply } from "./spice-gate.js";
+export { StyleCorpusRetriever, stripMediaPlaceholders, buildSafeFtsTrigramQuery, spiceHint, observeReply };
 import { dirname, join, resolve } from "node:path";
 
 import type { AgentEntry, AgentPlugin, AgentPluginRuntime, AgentStorage, PrepareStepContext } from "@yesimbot/agent-runtime";
@@ -12,12 +15,16 @@ import { collectTurns, segmentTurns } from "./collector.js";
 import { applyCorrections } from "./corrections.js";
 import { buildPatternEmbeddingMap } from "./embedding.js";
 import { createFeedbackStore, type FeedbackStore } from "./feedback.js";
-import { rewriteAssistantEntries } from "./final-style.js";
+import { renderAssistantText, rewriteAssistantEntries } from "./final-style.js";
 import { sendChatLearningForward } from "./forward.js";
 import {
+  boundaryChannelKey,
+  channelKeyOfScope,
   createEmptyGlobalRuleBank,
   createGlobalRuleStore,
+  kindsOf,
   mergeLocalPatterns,
+  selectBoundaries,
   selectGlobalChains,
   selectGlobalMemeTemplates,
   selectGlobalPatterns,
@@ -36,6 +43,7 @@ import { buildReflectionHistory, reflectOnSentMessage } from "./reflection.js";
 import { createChatLearningStore } from "./store.js";
 import { patternPhrase } from "./text.js";
 import type {
+  BoundaryMemory,
   ChatLearningConfig,
   ChatLearningState,
   GlobalRuleBank,
@@ -47,6 +55,8 @@ import type {
   MemeTemplate,
   ProactiveEventKind,
 } from "./types.js";
+
+const styleCorpusRetriever = new StyleCorpusRetriever();
 
 export const Config: Schema<ChatLearningConfig> = Schema.object({
   maxExamples: Schema.number().min(1).max(10).default(4).description("每轮最多注入几个示例对话段"),
@@ -70,6 +80,7 @@ export const Config: Schema<ChatLearningConfig> = Schema.object({
   ),
   embeddingModel: Schema.dynamic("registry.embeddingModels").default("").description("用于语义归并全局规律的 embedding 模型；留空则不使用 embedding"),
   embeddingSimilarity: Schema.number().min(0).max(1).default(0.92).description("embedding 语义归并阈值，越高要求越相似"),
+  clusterSimilarity: Schema.number().min(0).max(1).default(0.85).description("embedding 语义聚簇阈值；介于聚簇与归并之间只记录措辞变体，不新建行"),
   maxModelThreads: Schema.number().min(1).max(10).default(3).description("每次模型标注最多使用几条完整对话线程"),
   maxModelThreadMessages: Schema.number().min(4).max(100).default(30).description("每条线程最多送入模型的消息数"),
   reflectionModel: Schema.dynamic("registry.chatModels").default("").description("可选：用独立模型评价 bot 最近发言并生成风格反思；留空则关闭"),
@@ -207,16 +218,20 @@ export default class ChatLearningPlugin {
     let globalStylePatterns: readonly GlobalPattern[] = [];
     let globalMemeTemplates: readonly MemeTemplate[] = [];
     let globalChains: readonly GlobalChainPattern[] = [];
+    let globalBoundaries: readonly BoundaryMemory[] = [];
     let lastGlobalSyncAt = 0;
     let dirty = true;
     let building: Promise<void> | undefined;
+    const channelScopeKey = `${scope.platform}:${scope.channelId}`;
+    const isDirectScope = scope.type === "direct";
     let injectedTurn: string | undefined;
+    let cachedTurnReference: ModelMessage | undefined;
     const reflectionResultCache = new Map<string, string>();
     let currentEvent: ProactiveEventKind | undefined;
     let lastModelEnrichAt = state?.builtAt ?? 0;
 
     const buildReferenceBlock = (): string | undefined => {
-      const block = buildPromptBlock(state, undefined, config, globalPatterns, globalChains, globalStylePatterns, globalMemeTemplates);
+      const block = buildPromptBlock(state, undefined, config, globalPatterns, globalChains, globalStylePatterns, globalMemeTemplates, globalBoundaries);
       const reflectionBlock = buildReflectionHistory(reflectionStore, config.maxInjectedReflections);
       const parts: string[] = [];
       if (block) parts.push(block);
@@ -279,9 +294,21 @@ export default class ChatLearningPlugin {
             const mergedBank = mergeLocalPatterns(currentBank, current.responsePatterns, current.initiationPatterns, chainPatterns, key, Date.now(), {
               localEmbeddings,
               embeddingSimilarity: config.embeddingSimilarity,
+              clusterSimilarity: config.clusterSimilarity ?? 0.85,
+              boundaryTexts: current.turns.slice(-40).map((turn) => turn.text),
             });
-            const mergedWithTemplates = { ...mergedBank, templates: await buildGlobalMemeTemplates(this.ctx, config, mergedBank, this.modelCache) };
-            await globalStore.update(mergedWithTemplates);
+            const templates = await buildGlobalMemeTemplates(this.ctx, config, mergedBank, this.modelCache);
+            // 锁内重放一次合并：上面的 mergedBank 基于 await 之前的快照，
+            // 期间若有别的频道写过库，直接覆盖会丢掉它的增量。
+            const committed = await globalStore.updateWith((latest) =>
+              mergeLocalPatterns(latest, current.responsePatterns, current.initiationPatterns, chainPatterns, key, Date.now(), {
+                localEmbeddings,
+                embeddingSimilarity: config.embeddingSimilarity,
+                clusterSimilarity: config.clusterSimilarity ?? 0.85,
+                boundaryTexts: current.turns.slice(-40).map((turn) => turn.text),
+              }),
+            );
+            const mergedWithTemplates = { ...committed, templates };
             this.globalBanks.set(globalPath, mergedWithTemplates);
             globalPatterns = [...selectGlobalPatterns(mergedWithTemplates, "response", config.minGlobalChannels, config.maxGlobalPatterns)];
             globalStylePatterns = [
@@ -353,7 +380,7 @@ export default class ChatLearningPlugin {
             logger.debug("chat_learning.reflection_skipped", { scope, messageId: current.messageId });
             continue;
           }
-          const styleBlock = buildPromptBlock(state, undefined, config, globalPatterns, globalChains, globalStylePatterns, globalMemeTemplates);
+          const styleBlock = buildPromptBlock(state, undefined, config, globalPatterns, globalChains, globalStylePatterns, globalMemeTemplates, globalBoundaries);
           if (!styleBlock) continue;
           try {
             const ref = ctx.yesimbot.model.resolveChatModel(modelId);
@@ -416,6 +443,14 @@ export default class ChatLearningPlugin {
             }
           }
         }
+        for (const entry of next) {
+          if (entry.type === "message" && entry.data.role === "assistant") {
+            const replyText = renderAssistantText(entry.data.content).trim();
+            if (replyText) {
+              styleCorpusRetriever.recordBotReply(channelScopeKey, replyText);
+            }
+          }
+        }
         learnedEntries = [...learnedEntries, ...next];
         await historyStore.append(next);
         dirty = true;
@@ -423,8 +458,11 @@ export default class ChatLearningPlugin {
         return [...next];
       },
       prepareStep: async (messages: readonly ModelMessage[], context: PrepareStepContext) => {
-        if (injectedTurn === context.turnId) return messages;
+        if (injectedTurn === context.turnId) {
+          return cachedTurnReference ? [...messages, cachedTurnReference] : [...messages];
+        }
         injectedTurn = context.turnId;
+        cachedTurnReference = undefined;
         if (dirty) await rebuild(false);
         const eventKind = currentEvent;
         currentEvent = undefined;
@@ -434,12 +472,15 @@ export default class ChatLearningPlugin {
           ...selectGlobalPatterns(bank, "response", config.minGlobalChannels, config.maxGlobalPatterns),
           ...selectGlobalPatterns(bank, "initiation", config.minGlobalChannels, config.maxGlobalPatterns),
         ];
-        const currentText = latestUserText(messages);
+        const rawUserInput = latestUserRawText(messages);
+        const strippedInput = stripMediaPlaceholders(rawUserInput);
+        const currentText = strippedInput.text;
         globalChains = currentText
           ? [...selectRelevantGlobalChains(bank, currentText, config.minGlobalChannels, Math.min(config.maxGlobalPatterns, 3))]
           : [...selectGlobalChains(bank, config.minGlobalChannels, config.maxGlobalPatterns)];
         globalMemeTemplates = selectGlobalMemeTemplates(bank, Math.min(config.maxGlobalPatterns, 3));
-        const block = buildPromptBlock(state, eventKind, config, globalPatterns, globalChains, globalStylePatterns, globalMemeTemplates);
+        globalBoundaries = selectBoundaries(bank, 50, boundaryChannelKey(scopeKey(scope)));
+        const block = buildPromptBlock(state, eventKind, config, globalPatterns, globalChains, globalStylePatterns, globalMemeTemplates, globalBoundaries);
         logger.debug("chat_learning.prepare_step", {
           scope,
           turnId: context.turnId,
@@ -454,11 +495,30 @@ export default class ChatLearningPlugin {
         const referenceParts: string[] = [];
         if (block) referenceParts.push(block);
         if (reflectionBlock) referenceParts.push(reflectionBlock);
+        if (rawUserInput || strippedInput.hasMedia) {
+          try {
+            const isMaster = scope.channelId === "2596464506" || rawUserInput.includes("(2596464506)");
+            const nudgeMeta = extractNudgeHintMeta(messages);
+            const styleHandfeel = styleCorpusRetriever.retrievePromptBlock(rawUserInput, {
+              scopeKey: channelScopeKey,
+              isPrivate: isDirectScope,
+              isMaster,
+              hasMedia: strippedInput.hasMedia,
+              llmSceneGate: nudgeMeta.llmSceneGate,
+              llmInMove: nudgeMeta.llmInMove,
+            });
+            if (styleHandfeel) referenceParts.push(styleHandfeel);
+          } catch {
+            // 静默跳过，绝不阻塞聊天
+          }
+        }
         if (referenceParts.length === 0) return [...messages];
         const reference = referenceParts.join("\n\n");
-        const referenceMessage: ModelMessage = config.injectStyleAsSystem
-          ? { role: "system", content: reference }
-          : { role: "user", content: `[群聊风格参考，不要回复本段]\n\n${reference}` };
+        const referenceMessage: ModelMessage = {
+          role: "user",
+          content: `[群聊风格参考，不要回复本段]\n\n${reference}`,
+        };
+        cachedTurnReference = referenceMessage;
         return [...messages, referenceMessage];
       },
       stop: () => {
@@ -493,6 +553,7 @@ export default class ChatLearningPlugin {
           const globalBank = global.store.read();
           const globalPatterns = globalBank.patterns.length;
           const globalChains = globalBank.chains.length;
+          const boundaryCount = (globalBank.boundaries ?? []).length;
           this.logger.debug("chat_learning.status", {
             scope,
             turns: state?.turns.length ?? 0,
@@ -502,6 +563,7 @@ export default class ChatLearningPlugin {
             corrections: corrections.length,
             globalPatterns,
             globalChains,
+            globalBoundaries: boundaryCount,
           });
           const text = [
             `chat-learning ${scope.platform}:${scope.channelId}`,
@@ -512,6 +574,7 @@ export default class ChatLearningPlugin {
             `corrections=${corrections.length}`,
             `globalPatterns=${globalPatterns}`,
             `globalChains=${globalChains}`,
+            `boundaries=${boundaryCount}`,
             `state=${join(storagePath, "chat-learning.json")}`,
           ].join("\n");
           return await this.replyLong(session, text, text);
@@ -534,13 +597,15 @@ export default class ChatLearningPlugin {
             const { store, path } = await this.globalStoreFor(storagePath);
             const bank = this.globalBanks.get(path) ?? store.read();
             const limit = parsePositiveInt(options?.limit, 20);
-            const responsePatterns = bank.patterns.filter((pattern) => pattern.kind === "response").slice(0, limit);
-            const initiationPatterns = bank.patterns.filter((pattern) => pattern.kind === "initiation").slice(0, limit);
+            const responsePatterns = bank.patterns.filter((pattern) => kindsOf(pattern).includes("response")).slice(0, limit);
+            const initiationPatterns = bank.patterns.filter((pattern) => kindsOf(pattern).includes("initiation")).slice(0, limit);
             const chainPatterns = bank.chains.slice(0, limit);
+            const boundaries = bank.boundaries ?? [];
             const lines = [
               `global rules ${path}`,
               `patterns=${bank.patterns.length}`,
               `chains=${bank.chains.length}`,
+              `boundaries=${boundaries.length}`,
               `response=${responsePatterns.length}`,
               `initiation=${initiationPatterns.length}`,
             ];
@@ -555,6 +620,10 @@ export default class ChatLearningPlugin {
             if (chainPatterns.length > 0) {
               lines.push("", "chains:");
               lines.push(...chainPatterns.map(formatGlobalChain));
+            }
+            if (boundaries.length > 0) {
+              lines.push("", "boundaries:");
+              lines.push(...boundaries.slice(0, limit).map(formatBoundary));
             }
             const text = lines.join("\n");
             this.logger.debug("chat_learning.global_preview", { scope, path, patterns: bank.patterns.length, chains: bank.chains.length, limit });
@@ -597,7 +666,8 @@ export default class ChatLearningPlugin {
             ];
             const globalChains = selectGlobalChains(bank, this.config.minGlobalChannels, this.config.maxGlobalPatterns);
             const globalMemeTemplates = selectGlobalMemeTemplates(bank, Math.min(this.config.maxGlobalPatterns, 3));
-            const block = buildPromptBlock(state, eventKind, this.config, globalPatterns, globalChains, globalStylePatterns, globalMemeTemplates);
+            const globalBoundaries = selectBoundaries(bank, 50, boundaryChannelKey(scopeKey(scope)));
+            const block = buildPromptBlock(state, eventKind, this.config, globalPatterns, globalChains, globalStylePatterns, globalMemeTemplates, globalBoundaries);
             const reflection = await this.reflectionForPreview(scope, block);
             if (!block) return "当前没有可注入的学习上下文";
             this.logger.debug("chat_learning.preview", {
@@ -647,6 +717,7 @@ export default class ChatLearningPlugin {
           const globalBank = global.store.read();
           const globalPatterns = globalBank.patterns.length;
           const globalChains = globalBank.chains.length;
+          const boundaryCount = (globalBank.boundaries ?? []).length;
           this.logger.debug("chat_learning.sync_done", {
             scope,
             turns: state?.turns.length ?? 0,
@@ -655,6 +726,7 @@ export default class ChatLearningPlugin {
             initiationPatterns: state?.initiationPatterns.length ?? 0,
             globalPatterns,
             globalChains,
+            globalBoundaries: boundaryCount,
           });
           return [
             "已触发学习总结",
@@ -664,6 +736,7 @@ export default class ChatLearningPlugin {
             `initiationPatterns=${state?.initiationPatterns.length ?? 0}`,
             `globalPatterns=${globalPatterns}`,
             `globalChains=${globalChains}`,
+            `boundaries=${boundaryCount}`,
           ].join("\n");
         } catch (cause) {
           this.logger.warn("chat_learning.sync_failed", { cause: cause instanceof Error ? cause.message : String(cause) });
@@ -924,6 +997,9 @@ export default class ChatLearningPlugin {
       bank = mergeLocalPatterns(bank, responsePatterns, initiationPatterns, chainPatterns, scopeKeyValue, Date.now(), {
         localEmbeddings,
         embeddingSimilarity: config.embeddingSimilarity,
+        clusterSimilarity: config.clusterSimilarity ?? 0.85,
+        // 历史同步也采边界：同一句按 id 去重、strength 取 max，重复扫描不会抬高权重。
+        boundaryTexts: turns.slice(-40).map((turn) => turn.text),
       });
     }
 
@@ -1078,7 +1154,16 @@ function parsePositiveInt(value: unknown, fallback: number): number {
 
 function formatGlobalPattern(pattern: GlobalPattern): string {
   const total = pattern.channels.reduce((sum, channel) => sum + channel.frequency, 0);
-  return `- [${pattern.intent}] "${pattern.phrase}" channels=${pattern.channels.length} total=${total}`;
+  const kinds = kindsOf(pattern).join("/");
+  const intents = [...new Set([pattern.intent, ...(pattern.intents ?? [])])].join("/");
+  const salience = typeof pattern.salience === "number" ? pattern.salience.toFixed(2) : "—";
+  const variants = pattern.variants && pattern.variants.length > 0 ? ` variants=${pattern.variants.length}` : "";
+  return `- [${kinds}:${intents}] "${pattern.phrase}" channels=${pattern.channels.length} total=${total} salience=${salience}${variants}`;
+}
+
+function formatBoundary(boundary: BoundaryMemory): string {
+  const revoked = boundary.revokedAt === undefined ? "" : ` revoked@${boundary.revokedAt}`;
+  return `- "${boundary.text}" strength=${boundary.strength.toFixed(2)} hits=${boundary.hits}${revoked}`;
 }
 
 function formatGlobalChain(chain: GlobalChainPattern): string {
@@ -1086,15 +1171,57 @@ function formatGlobalChain(chain: GlobalChainPattern): string {
   return `- ${chain.chain.join(" -> ")} channels=${chain.channels.length} total=${total}`;
 }
 
-function latestUserText(messages: readonly ModelMessage[]): string {
+
+function extractNudgeHintMeta(messages: readonly ModelMessage[]): {
+  llmSceneGate?: "work_delivery" | "comfort" | "casual";
+  llmInMove?: string;
+} {
   for (const message of [...messages].reverse()) {
     if (message.role !== "user") continue;
     const content = message.content;
-    if (typeof content === "string") {
-      return content.replace(/^\[time=[^\]]*\]\s*/, "").trim();
+    const raw =
+      typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content
+              .map((part) =>
+                typeof part === "string"
+                  ? part
+                  : typeof part === "object" && part !== null && "text" in part
+                    ? String((part as { text?: unknown }).text ?? "")
+                    : "",
+              )
+              .join(" ")
+          : "";
+    if (!raw.includes("<nudge_hint")) continue;
+    const gateMatch = raw.match(/data-gate="([^"]+)"/i) ?? raw.match(/gate=([a-z_]+)/i);
+    const moveMatch = raw.match(/data-move="([^"]+)"/i) ?? raw.match(/move=([a-z_]+)/i);
+    const rawGate = gateMatch?.[1]?.trim();
+    const llmSceneGate: "work_delivery" | "comfort" | "casual" | undefined =
+      rawGate === "comfort"
+        ? "comfort"
+        : rawGate === "work_delivery" || rawGate === "work"
+          ? "work_delivery"
+          : rawGate === "casual"
+            ? "casual"
+            : undefined;
+    const llmInMove = moveMatch?.[1]?.trim() || undefined;
+    if (llmSceneGate || llmInMove) {
+      return { llmSceneGate, llmInMove };
     }
-    if (Array.isArray(content)) {
-      const text = content
+  }
+  return {};
+}
+
+function latestUserRawText(messages: readonly ModelMessage[]): string {
+  for (const message of [...messages].reverse()) {
+    if (message.role !== "user") continue;
+    const content = message.content;
+    let raw = "";
+    if (typeof content === "string") {
+      raw = content;
+    } else if (Array.isArray(content)) {
+      raw = content
         .map((part) => {
           if (typeof part === "string") return part;
           if (typeof part === "object" && part !== null && "text" in part) {
@@ -1102,12 +1229,26 @@ function latestUserText(messages: readonly ModelMessage[]): string {
           }
           return "";
         })
-        .join(" ")
-        .trim();
-      if (text) return text;
+        .join(" ");
     }
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    if (
+      trimmed.startsWith("[群聊风格参考，不要回复本段]") ||
+      trimmed.startsWith("[SYSTEM_NOTIFICATION]") ||
+      trimmed.startsWith("<nudge_hint")
+    ) {
+      continue;
+    }
+    return trimmed;
   }
   return "";
+}
+
+function latestUserText(messages: readonly ModelMessage[]): string {
+  const raw = latestUserRawText(messages);
+  if (!raw) return "";
+  return stripMediaPlaceholders(raw).text;
 }
 
 function quoteText(quote: Session["quote"] | undefined): string {
@@ -1144,14 +1285,22 @@ function scopeOf(session: Session | undefined): FullScope | null {
   return { type: "guild", platform: session.platform, selfId: session.selfId, channelId: session.channelId, guildId };
 }
 
+/**
+ * 频道规范键：只有 direct 与 guild 两态。
+ * 历史缺陷（P0-7）：写入路径用 `guild:`，从历史条目重建时用 `shared:`，
+ * 同一个群算出两个指纹，被当成两个频道，直接越过 minGlobalChannels。
+ * 两处统一走这里，保证读写同源。
+ */
 function scopeKey(scope: FullScope): string {
-  return `${scope.type}:${scope.platform}:${scope.selfId}:${scope.channelId}`;
+  const kind = scope.type === "direct" ? "direct" : "guild";
+  return `${kind}:${scope.platform}:${scope.selfId}:${scope.channelId}`;
 }
 
 function scopeKeyFromEntry(entry: AgentEntry): string | undefined {
   if (entry.type !== "message" || !isMessage(entry.data)) return undefined;
   const data = entry.data.data;
-  return `${data.channel.type === Universal.Channel.Type.DIRECT ? "direct" : "shared"}:${data.platform}:${data.selfId}:${data.channel.id}`;
+  const kind = data.channel.type === Universal.Channel.Type.DIRECT ? "direct" : "guild";
+  return `${kind}:${data.platform}:${data.selfId}:${data.channel.id}`;
 }
 
 function selfIdFromEntry(entry: AgentEntry | undefined): string | undefined {
