@@ -1,0 +1,29 @@
+FROM local/shion-yesimbot:v4
+COPY yesimbot/core/dist/index.js /opt/shion/yesimbot/core/dist/index.js
+COPY yesimbot/core/dist/index.cjs /opt/shion/yesimbot/core/dist/index.cjs
+# agent-runtime 是 core 的运行时依赖：interrupt 超时、工具硬超时、turn 队列都在这里
+COPY yesimbot/packages/agent-runtime/dist/index.cjs /opt/shion/yesimbot/packages/agent-runtime/dist/index.cjs
+COPY yesimbot/packages/agent-runtime/dist/index.js /opt/shion/yesimbot/packages/agent-runtime/dist/index.js
+COPY yesimbot/plugins/chat-learning/dist/ /opt/shion/yesimbot/plugins/chat-learning/dist/
+COPY yesimbot/plugins/global-brain/dist/ /opt/shion/yesimbot/plugins/global-brain/dist/
+COPY yesimbot/plugins/will-policy/dist/ /opt/shion/yesimbot/plugins/will-policy/dist/
+COPY yesimbot/plugins/workspace/dist/ /opt/shion/yesimbot/plugins/workspace/dist/
+COPY koishi-app/patches/adapter-milky/index.js /opt/shion/koishi-app/node_modules/koishi-plugin-adapter-milky/lib/index.js
+
+# 构建期断言：任何一项缺失就让构建失败，不要静默降级
+RUN grep -q 'case "group_nudge"' /opt/shion/koishi-app/node_modules/koishi-plugin-adapter-milky/lib/index.js \
+ && grep -q 'case "friend_nudge"' /opt/shion/koishi-app/node_modules/koishi-plugin-adapter-milky/lib/index.js \
+ && grep -q 'quoteAttrs' /opt/shion/koishi-app/node_modules/koishi-plugin-adapter-milky/lib/index.js \
+ && grep -q 'startLoginRetry' /opt/shion/koishi-app/node_modules/koishi-plugin-adapter-milky/lib/index.js \
+ && grep -q 'translateMilkyEvent' /opt/shion/yesimbot/core/dist/index.cjs \
+ && grep -q 'notice.reaction' /opt/shion/yesimbot/core/dist/index.cjs \
+ && grep -q 'turn.abandoned' /opt/shion/yesimbot/packages/agent-runtime/dist/index.cjs \
+ && grep -q 'tool.timeout' /opt/shion/yesimbot/packages/agent-runtime/dist/index.cjs \
+ && grep -q 'runtime.compact.start' /opt/shion/yesimbot/core/dist/index.cjs \
+ && grep -q 'delivery.segment_failed' /opt/shion/yesimbot/core/dist/index.cjs \
+ && grep -q 'prepare_step.rebuild_skipped' /opt/shion/yesimbot/plugins/chat-learning/dist/index.cjs \
+ && grep -q 'final_style_skipped' /opt/shion/yesimbot/plugins/chat-learning/dist/index.cjs \
+ && grep -q 'revokedAt' /opt/shion/yesimbot/plugins/chat-learning/dist/index.cjs \
+ && grep -q 'global_brain.compacted' /opt/shion/yesimbot/plugins/global-brain/dist/index.cjs \
+ && grep -q 'deepseek_judge.degraded' /opt/shion/yesimbot/plugins/will-policy/dist/index.cjs \
+ && echo "[verify] adapter + translator + r2 + r3 + r12 + r14 + r15 + r19 patches present"
