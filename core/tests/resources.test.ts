@@ -13,7 +13,7 @@ import { h } from "koishi";
 import { createReadTool, createSendMessageTool, type ResourceReadResult } from "../src/agents/tools.js";
 import { ChannelArtifactStore } from "../src/resources/artifact.js";
 import { ChannelAssetStore } from "../src/resources/asset.js";
-import { ChannelResources, prepareOutputSegments, type ResourceReader } from "../src/resources/index.js";
+import { ChannelResources, prepareOutputSegments, ResourceReadError, type ResourceReader } from "../src/resources/index.js";
 import { persistElements } from "../src/resources/input.js";
 import { PNG_BYTES } from "./helpers/index.js";
 
@@ -331,8 +331,9 @@ describe("prepareOutputSegments", () => {
     expect(img.attrs.src).not.toContain("artifact://");
   });
 
-  it("omits an unavailable resource and preserves sibling content", async () => {
+  it("replaces an unavailable image with a placeholder and preserves sibling content (B1-9)", async () => {
     const resources = await resourcesWith(async () => undefined);
+    const warn = vi.fn();
 
     const prepared = await prepareOutputSegments(
       [
@@ -342,10 +343,15 @@ describe("prepareOutputSegments", () => {
         ],
       ],
       resources,
+      undefined,
+      { warn },
     );
 
-    expect(prepared[0]).toHaveLength(1);
+    // 文字没有被过滤掉，失败图片变成可读占位
+    expect(prepared[0]).toHaveLength(2);
     expect(prepared[0]![0]).toMatchObject({ type: "text", attrs: { content: "keep" } });
+    expect(prepared[0]![1]).toMatchObject({ type: "text", attrs: { content: "[图片加载失败]" } });
+    expect(warn).toHaveBeenCalledWith("output.image.unavailable", expect.objectContaining({ reason: "resource_unavailable" }));
   });
 
   it("leaves unrecognized elements and non-resource sources untouched", async () => {
@@ -375,18 +381,38 @@ describe("prepareOutputSegments", () => {
     expect((full[0]![0] as { attrs: { src: string } }).attrs.src).toContain("data:image/png;base64,");
 
     const prefix = await prepareOutputSegments([[{ type: "img", attrs: { src: `asset://${id.slice(0, 7)}` }, children: [] }]], resources);
-    expect(prefix).toHaveLength(0);
+    // 短 ID 解析不了：仍要留下可见占位，否则这一段会整段消失（B1-9）
+    expect(prefix).toHaveLength(1);
+    expect(prefix[0]![0]).toMatchObject({ type: "text", attrs: { content: "[图片加载失败]" } });
   });
 
-  it("drops a segment that becomes empty after resource omission", async () => {
-    const resources = await resourcesWith(async () => undefined);
+  it("keeps a segment whose only image failed by substituting a placeholder", async () => {
+    const resources = await resourcesWith(async () => Promise.reject(new ResourceReadError("resource_not_found")));
+    const warn = vi.fn();
 
     const prepared = await prepareOutputSegments(
-      [[{ type: "img", attrs: { src: "artifact://missing/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4" }, children: [] }]],
+      [[h("img", { src: "artifact://missing/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4" })]],
       resources,
+      undefined,
+      { warn },
     );
 
+    expect(prepared).toHaveLength(1);
+    expect(prepared[0]![0]).toMatchObject({ type: "text", attrs: { content: "[图片加载失败]" } });
+  });
+
+  it("warns when a segment is dropped because every element was unresolvable", async () => {
+    const resources = await resourcesWith(async () => Promise.reject(new ResourceReadError("resource_not_found")));
+    const warn = vi.fn();
+
+    // file 失败仍然按原有语义丢弃（本单只改图片）→ 段变空 → 必须留一条 warn，而不是静默不发
+    const prepared = await prepareOutputSegments([[h("file", { src: "workspace:///reports/gone.bin" })]], resources, undefined, { warn });
+
     expect(prepared).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(
+      "output.segments.empty",
+      expect.objectContaining({ segments: 1, droppedSegments: 1, deliveredSegments: 0, reason: "all-elements-unresolvable" }),
+    );
   });
 
   it("materializes ordinary files with a generic MIME fallback", async () => {
@@ -411,8 +437,14 @@ describe("prepareOutputSegments", () => {
 
   it("does not trust an image MIME hint for arbitrary output bytes", async () => {
     const resources = await resourcesWith(async () => ({ bytes: new Uint8Array([1, 2, 3]), mediaType: "image/png" }));
-    const prepared = await prepareOutputSegments([[{ type: "img", attrs: { src: "workspace:///fake.png" }, children: [] }]], resources);
-    expect(prepared).toHaveLength(0);
+    const warn = vi.fn();
+    const prepared = await prepareOutputSegments([[{ type: "img", attrs: { src: "workspace:///fake.png" }, children: [] }]], resources, undefined, {
+      warn,
+    });
+    // 字节不是真图片：不按 image/png 发出去，但不能让整段消失
+    expect(prepared).toHaveLength(1);
+    expect(prepared[0]![0]).toMatchObject({ type: "text", attrs: { content: "[图片加载失败]" } });
+    expect(warn).toHaveBeenCalledWith("output.image.unavailable", expect.objectContaining({ reason: "not_an_image" }));
   });
 });
 

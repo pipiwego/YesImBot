@@ -161,40 +161,85 @@ export class ChannelResources {
   }
 }
 
+export interface OutputSegmentLogger {
+  warn(message: string, meta?: Record<string, unknown>): unknown;
+}
+
+/** 兜底 logger：prepareOutputSegments 的调用方在 runtimes/（本轮不动），拿不到 ctx.logger，
+ *  退化到 stdout —— 至少 `docker logs` 能看到，而不是静默丢稿。 */
+const consoleOutputLogger: OutputSegmentLogger = {
+  warn(message, meta) {
+    try {
+      console.warn(`[yesimbot.resources] ${message}`, meta ?? {});
+    } catch {}
+  },
+};
+
+const IMAGE_PLACEHOLDER = "[图片加载失败]";
+
 export async function prepareOutputSegments(
   segments: readonly (readonly Element[])[],
   resources: ChannelResources,
   signal?: AbortSignal,
+  logger: OutputSegmentLogger = consoleOutputLogger,
 ): Promise<Element[][]> {
   const prepared: Element[][] = [];
+  let dropped = 0;
   for (const segment of segments) {
-    const next = await Promise.all(segment.map((element) => prepareElement(element, resources, signal)));
+    const next = await Promise.all(segment.map((element) => prepareElement(element, resources, signal, logger)));
     const filtered = next.filter((element): element is Element => element !== undefined);
     if (filtered.length) prepared.push(filtered);
+    else dropped += 1;
+  }
+  if (dropped > 0) {
+    // 旧实现这里一声不响：整段被过滤掉 → 一句话都不发，日志里查不到任何线索（B1-9）。
+    try {
+      logger.warn("output.segments.empty", {
+        segments: segments.length,
+        droppedSegments: dropped,
+        deliveredSegments: prepared.length,
+        reason: "all-elements-unresolvable",
+      });
+    } catch {}
   }
   return prepared;
 }
 
-async function prepareElement(element: Element, resources: ChannelResources, signal?: AbortSignal): Promise<Element | undefined> {
+async function prepareElement(
+  element: Element,
+  resources: ChannelResources,
+  signal?: AbortSignal,
+  logger: OutputSegmentLogger = consoleOutputLogger,
+): Promise<Element | undefined> {
   if (element.children.length)
     return h(
       element.type,
       element.attrs,
-      (await Promise.all(element.children.map((child) => prepareElement(child, resources, signal)))).filter((child): child is Element => child !== undefined),
+      (await Promise.all(element.children.map((child) => prepareElement(child, resources, signal, logger)))).filter(
+        (child): child is Element => child !== undefined,
+      ),
     );
   const src = element.attrs.src;
   if (typeof src !== "string" || !RESOURCE_SOURCE.test(src) || (element.type !== "img" && element.type !== "file")) return element;
   if (element.type === "img" && !/^asset:\/\/[a-f0-9]{32}$/.test(src)) {
     // ponytail: full 32-hex ID required for output resolution; prefix/short IDs are not resolvable
     const scheme = src.slice(0, src.indexOf(":"));
-    if (scheme === "asset") return undefined;
+    if (scheme === "asset") return imagePlaceholder(src, logger, "incomplete_asset_id");
   }
   const opened = await resources.open(src, signal);
-  if (!opened) return undefined;
+  if (!opened) return element.type === "img" ? imagePlaceholder(src, logger, "resource_unavailable") : undefined;
   const detected = detectMediaType(opened.bytes);
-  if (element.type === "img" && !detected) return undefined;
+  if (element.type === "img" && !detected) return imagePlaceholder(src, logger, "not_an_image");
   const mediaType = detected ?? opened.mediaType ?? "application/octet-stream";
   return h(element.type, { ...element.attrs, src: `data:${mediaType};base64,${Buffer.from(opened.bytes).toString("base64")}` });
+}
+
+/** 图片失败换成可读占位，而不是 undefined：整段只有一张图时，undefined 会让这一段彻底消失。 */
+function imagePlaceholder(src: string, logger: OutputSegmentLogger, reason: string): Element {
+  try {
+    logger.warn("output.image.unavailable", { reason, src: src.length > 80 ? `${src.slice(0, 80)}…` : src });
+  } catch {}
+  return h.text(IMAGE_PLACEHOLDER);
 }
 
 function detectMediaType(bytes: Uint8Array): string | undefined {

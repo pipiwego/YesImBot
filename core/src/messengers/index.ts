@@ -13,6 +13,24 @@ type RunResult = Extract<RuntimeResult, { readonly kind: "run" }>;
 
 type DeliveryContext = { turnId: string; messageId: string; segmentIndex: number; segmentTotal: number };
 
+/** 分段投递统计：`yesimbot/delivered` 会额外带上这些字段（DeliveredPayload 的结构化扩展）。 */
+export interface DeliveryStats {
+  readonly segmentsDelivered: number;
+  readonly segmentsFailed: number;
+  readonly segmentsTotal: number;
+}
+
+/** 一次投递的逐段记账。`aborted` 同时充当 pacedSegments 的进度信号。 */
+interface DeliveryTally {
+  delivered: number;
+  failed: number;
+  attempted: number;
+  aborted: boolean;
+  reason: string;
+  text: string[];
+  error?: unknown;
+}
+
 /** `post()` 的投递结果：是否真的产出了 assistant 文本并发出（供内部通知链路判定「到底说没说出口」）。 */
 export interface PostOutcome {
   readonly produced: boolean;
@@ -168,14 +186,8 @@ export class Messenger {
   private async deliverPassive(session: Session, runtime: ChannelRuntime, result: RunResult): Promise<void> {
     const delivery = emptyDeliveryContext(result.eventId);
     await this.serializeDelivery(runtime.context, async () => {
-      const sent: string[] = [];
-      try {
-        for await (const segment of this.pacedSegments(result, delivery, sent)) await session.send([...segment]);
-      } catch (cause) {
-        await this.failDelivery(runtime, result, delivery, cause);
-        return;
-      }
-      this.emitDelivered(runtime.context, delivery, sent);
+      const tally = await this.deliverSegments(runtime.context, delivery, result, (segment) => session.send([...segment]));
+      await this.settleDelivery(runtime, result, delivery, tally);
     });
   }
 
@@ -183,32 +195,107 @@ export class Messenger {
     const delivery = emptyDeliveryContext(result.eventId);
     let outcome: PostOutcome = { produced: false, segments: 0 };
     await this.serializeDelivery(runtime.context, async () => {
-      const sent: string[] = [];
-      // 只统计「sendMessage 真的返回了」的段数。pacedSegments 的 sink 是在 yield 之前
-      // 记的，用它当成功计数会把「首段就发失败」误判成「说了一半」，从而跳过兜底 → 丢稿。
-      let delivered = 0;
-      try {
-        for await (const segment of this.pacedSegments(result, delivery, sent)) {
-          await bot.sendMessage(channelId, [...segment]);
-          delivered += 1;
-        }
-      } catch (cause) {
-        outcome = { produced: false, segments: delivered, error: cause instanceof Error ? cause.message : String(cause) };
-        await this.failDelivery(runtime, result, delivery, cause);
-        return;
-      }
-      outcome = { produced: delivered > 0, segments: delivered };
-      this.emitDelivered(runtime.context, delivery, sent);
+      const tally = await this.deliverSegments(runtime.context, delivery, result, (segment) => bot.sendMessage(channelId, [...segment]));
+      outcome = {
+        produced: tally.delivered > 0,
+        segments: tally.delivered,
+        ...(tally.failed > 0 || tally.aborted ? { error: tally.aborted ? "aborted" : tally.reason } : {}),
+      };
+      await this.settleDelivery(runtime, result, delivery, tally);
     });
     return outcome;
+  }
+
+  /**
+   * 逐段投递：**单段失败只记账，不中断后续段**。
+   * 旧实现把整个 for-await 包在一个 try 里：第 N 段抛错 → 第 N+1 段起全部丢弃，
+   * 一句话发失败就吞掉后面所有内容（B1-7）。成功段文本也只在 send 真的返回后才记，
+   * 避免把「首段就失败」误判成「说了一半」。
+   */
+  private async deliverSegments(
+    ctx: ChannelContext,
+    delivery: DeliveryContext,
+    result: RunResult,
+    send: (segment: readonly Element[]) => Promise<unknown>,
+  ): Promise<DeliveryTally> {
+    const tally: DeliveryTally = { delivered: 0, failed: 0, attempted: 0, aborted: false, reason: "", text: [] };
+    try {
+      for await (const segment of this.pacedSegments(result, delivery, tally)) {
+        tally.attempted += 1;
+        try {
+          await send(segment);
+        } catch (cause) {
+          tally.failed += 1;
+          tally.error ??= cause;
+          tally.reason = cause instanceof Error ? cause.message : String(cause);
+          // 每段失败都单独留 trace：段索引 / 总段数 / 失败原因
+          this.warnSegment(ctx, "delivery.segment_failed", { cause, delivery, reason: tally.reason });
+          continue;
+        }
+        tally.delivered += 1;
+        this.collectText(tally.text, segment);
+      }
+    } catch (cause) {
+      // output 流本身抛错（不是某段的 send 失败）：按中断 / 失败归类，不再静默吞掉
+      if (result.signal.aborted) {
+        tally.aborted = true;
+        tally.reason = "aborted";
+      } else {
+        tally.failed += 1;
+        tally.error ??= cause;
+        tally.reason = cause instanceof Error ? cause.message : String(cause);
+        this.warnSegment(ctx, "delivery.stream_failed", { cause, delivery, reason: tally.reason });
+      }
+    }
+    return tally;
+  }
+
+  /**
+   * 全部段跑完后按**实际结果**汇总：
+   * - 至少一段成功 → 部分成功，发射 `yesimbot/delivered`（带成功/失败/总段数）；
+   * - 一段都没成功且确有失败 → 写 `delivery.failed`；
+   * - 中断 → 一律写 `delivery.failed`（reason 落在 error.message = "aborted"），
+   *   已经发出去的段照样更新 `delivered`，不让 abort 顺手抹掉插嘴判定的记忆；
+   * - 压根没有段（空输出）→ 两条都不写，保持原有语义。
+   */
+  private async settleDelivery(
+    runtime: ChannelRuntime,
+    result: RunResult,
+    delivery: DeliveryContext,
+    tally: DeliveryTally,
+  ): Promise<void> {
+    const ctx = runtime.context;
+    const stats: DeliveryStats = {
+      segmentsDelivered: tally.delivered,
+      segmentsFailed: tally.failed,
+      segmentsTotal: Math.max(tally.attempted, tally.delivered + tally.failed),
+    };
+    if (tally.aborted) {
+      await this.failDelivery(runtime, result, delivery, tally.error, "aborted");
+      if (tally.delivered > 0) this.emitDelivered(ctx, delivery, tally.text, stats);
+      return;
+    }
+    if (tally.delivered === 0) {
+      if (tally.failed > 0) await this.failDelivery(runtime, result, delivery, tally.error ?? new Error("delivery failed"));
+      return;
+    }
+    if (tally.failed > 0) {
+      this.warnSegment(ctx, "delivery.partial", {
+        delivery,
+        reason: `${tally.delivered}/${stats.segmentsTotal} segments delivered`,
+      });
+    }
+    this.emitDelivered(ctx, delivery, tally.text, stats);
   }
 
   /**
    * `yesimbot/delivered` 此前只有监听者、没有任何发射点，
    * 导致 will-policy 的 recentBotMsgIds / lastBotReplyAt 永远是空的，
    * 「引用诗音的回复才触发」与「45 秒同人追问直通」双双失效。
+   * 现在额外带分段统计（segmentsDelivered / segmentsFailed / segmentsTotal / partial）：
+   * 部分成功也算发射 —— 说出口的内容必须让下一轮插嘴判定看得见。
    */
-  private emitDelivered(ctx: ChannelContext, delivery: DeliveryContext, sent: readonly string[]): void {
+  private emitDelivered(ctx: ChannelContext, delivery: DeliveryContext, sent: readonly string[], stats?: DeliveryStats): void {
     if (sent.length === 0) return;
     const text = sent.join("");
     if (!text.trim()) return;
@@ -223,8 +310,11 @@ export class Messenger {
       turnId: delivery.turnId,
       text,
     };
+    // DeliveredPayload 定义在 messages/（本轮不改那里）：额外字段按结构化扩展透传，
+    // 老监听者只读已知字段，行为不变。
+    const detail = stats ? { ...payload, ...stats, partial: stats.segmentsFailed > 0 } : payload;
     try {
-      this.ctx.emit("yesimbot/delivered", payload);
+      this.ctx.emit("yesimbot/delivered", detail as DeliveredPayload);
     } catch (cause) {
       this.warn("messenger.delivered_emit_failed", cause, ctx.platform);
     }
@@ -233,12 +323,15 @@ export class Messenger {
   private async *pacedSegments(
     result: RunResult,
     delivery: DeliveryContext,
-    sink?: string[],
+    progress?: { aborted: boolean },
   ): AsyncIterable<readonly Element[]> {
     let elapsed = 0;
     for await (const output of result.output) {
       for (const [index, segment] of output.segments.entries()) {
-        if (result.signal.aborted) return;
+        if (result.signal.aborted) {
+          if (progress) progress.aborted = true;
+          return;
+        }
         this.logger.debug("messenger.delivery.segment", {
           turnId: output.turnId,
           messageId: output.messageId,
@@ -249,26 +342,59 @@ export class Messenger {
         const startedAt = Date.now();
         await sleep(delay, result.signal);
         elapsed += Math.max(delay, Date.now() - startedAt);
-        if (result.signal.aborted) return;
+        if (result.signal.aborted) {
+          if (progress) progress.aborted = true;
+          return;
+        }
         delivery.turnId = output.turnId;
         delivery.messageId = output.messageId;
         delivery.segmentIndex = index + 1;
         delivery.segmentTotal = output.segments.length;
-        if (sink) {
-          try {
-            sink.push(formatElements(segment));
-          } catch {
-            // 渲染失败不影响投递本身
-          }
-        }
         yield segment;
       }
     }
   }
 
-  private async failDelivery(runtime: ChannelRuntime, result: RunResult, delivery: DeliveryContext, cause: unknown): Promise<void> {
-    await runtime.fail(result.eventId, cause, delivery);
-    this.warn("delivery.failed", cause, runtime.context.platform);
+  private async failDelivery(
+    runtime: ChannelRuntime,
+    result: RunResult,
+    delivery: DeliveryContext,
+    cause: unknown,
+    reason?: string,
+  ): Promise<void> {
+    // `delivery.failed` 事件的 error 只有 name/message，没有独立 reason 字段：把 reason 编进 message。
+    const error = reason === undefined ? cause : namedError(reason, "AbortError");
+    await runtime.fail(result.eventId, error, delivery);
+    this.warnSegment(runtime.context, "delivery.failed", {
+      cause: error,
+      delivery,
+      reason: reason ?? (cause instanceof Error ? cause.message : String(cause)),
+    });
+  }
+
+  private collectText(sink: string[], segment: readonly Element[]): void {
+    try {
+      sink.push(formatElements(segment));
+    } catch {
+      // 渲染失败不影响投递本身
+    }
+  }
+
+  /** 带段索引 / 总段数 / 原因的结构化 warn：`warn()` 只带 code+cause，定位不到是哪一段丢的。 */
+  private warnSegment(ctx: ChannelContext, code: string, info: { cause?: unknown; delivery: DeliveryContext; reason: string }): void {
+    try {
+      this.logger.warn({
+        code,
+        platform: ctx.platform,
+        channelId: ctx.channelId,
+        turnId: info.delivery.turnId,
+        messageId: info.delivery.messageId,
+        segmentIndex: info.delivery.segmentIndex,
+        segmentTotal: info.delivery.segmentTotal,
+        reason: info.reason,
+        cause: info.cause === undefined ? undefined : info.cause instanceof Error ? info.cause.message : String(info.cause),
+      });
+    } catch {}
   }
 
   private async serializeDelivery(ctx: ChannelContext, task: () => Promise<void>): Promise<void> {
@@ -343,6 +469,12 @@ async function translateDefault(ctx: Context, session: Session, resources: Chann
     },
   };
   return { ...base, messageId: session.messageId, elements: await resources.persistElements(ctx, session.elements) };
+}
+
+function namedError(reason: string, name: string): Error {
+  const error = new Error(reason);
+  error.name = name;
+  return error;
 }
 
 function emptyDeliveryContext(eventId: string): DeliveryContext {

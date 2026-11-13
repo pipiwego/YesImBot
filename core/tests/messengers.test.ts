@@ -193,3 +193,123 @@ describe("Messenger", () => {
     expect(runtimes.get).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// R14 / B1-7 分段投递：单段失败不吞后续段，按实际结果汇总
+// ---------------------------------------------------------------------------
+
+function runnable(segments: readonly (readonly unknown[])[], signal: AbortSignal = new AbortController().signal) {
+  const context = { type: "guild", platform: "test", channelId: "room-1", guildId: "room-1" };
+  return {
+    context,
+    fail: vi.fn(async () => undefined),
+    post: vi.fn(async () => ({
+      kind: "run" as const,
+      eventId: "event-1",
+      output: (async function* () {
+        yield { turnId: "turn-1", messageId: "assistant-1", segments };
+      })(),
+      signal,
+    })),
+  };
+}
+
+function collector(ctx: Context): unknown[] {
+  const seen: unknown[] = [];
+  ctx.on("yesimbot/delivered", (payload) => seen.push(payload));
+  return seen;
+}
+
+describe("Messenger segmented delivery accounting", () => {
+  it("keeps sending later segments after one fails, then emits delivered with the real counts", async () => {
+    const ctx = new Context();
+    const sendMessage = vi
+      .fn()
+      .mockResolvedValueOnce([])
+      .mockRejectedValueOnce(new Error("segment-2 boom"))
+      .mockResolvedValueOnce([]);
+    ctx.bots.push({ platform: "test", selfId: "bot-1", sendMessage } as never);
+    const delivered = collector(ctx);
+    const runtime = runnable([[h.text("one")], [h.text("two")], [h.text("three")]]);
+    const channels = { resolve: vi.fn(async () => ({ context: runtime.context })) };
+    const runtimes = { get: vi.fn(async () => runtime) };
+    const messenger = new Messenger(ctx, config, channels as never, runtimes as never);
+
+    const outcome = await messenger.post(event);
+
+    expect(sendMessage).toHaveBeenCalledTimes(3);
+    expect(sendMessage.mock.calls[2]![1]).toEqual([h.text("three")]);
+    expect(runtime.fail).not.toHaveBeenCalled();
+    expect(outcome).toMatchObject({ produced: true, segments: 2 });
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({
+      text: "onethree",
+      segmentsDelivered: 2,
+      segmentsFailed: 1,
+      segmentsTotal: 3,
+      partial: true,
+    });
+  });
+
+  it("writes delivery.failed only when every segment fails", async () => {
+    const ctx = new Context();
+    const sendMessage = vi.fn(async () => Promise.reject(new Error("offline")));
+    ctx.bots.push({ platform: "test", selfId: "bot-1", sendMessage } as never);
+    const delivered = collector(ctx);
+    const runtime = runnable([[h.text("one")], [h.text("two")], [h.text("three")]]);
+    const channels = { resolve: vi.fn(async () => ({ context: runtime.context })) };
+    const runtimes = { get: vi.fn(async () => runtime) };
+    const messenger = new Messenger(ctx, config, channels as never, runtimes as never);
+
+    const outcome = await messenger.post(event);
+
+    expect(sendMessage).toHaveBeenCalledTimes(3);
+    expect(delivered).toHaveLength(0);
+    expect(runtime.fail).toHaveBeenCalledOnce();
+    expect(runtime.fail).toHaveBeenCalledWith("event-1", expect.objectContaining({ message: "offline" }), {
+      turnId: "turn-1",
+      messageId: "assistant-1",
+      segmentIndex: 3,
+      segmentTotal: 3,
+    });
+    expect(outcome).toMatchObject({ produced: false, segments: 0, error: "offline" });
+  });
+
+  it("writes delivery.failed with reason aborted when the turn is aborted mid-delivery", async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = new Context();
+      const controller = new AbortController();
+      const sendMessage = vi.fn(async () => []);
+      ctx.bots.push({ platform: "test", selfId: "bot-1", sendMessage } as never);
+      const delivered = collector(ctx);
+      const runtime = runnable([[h.text("one")], [h.text("two")]], controller.signal);
+      const channels = { resolve: vi.fn(async () => ({ context: runtime.context })) };
+      const runtimes = { get: vi.fn(async () => runtime) };
+      const messenger = new Messenger(ctx, { ...config, pacing: { charactersPerSecond: 1, maxTotalDelayMs: 1_000 } }, channels as never, runtimes as never);
+
+      const pending = messenger.post(event);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+
+      controller.abort();
+      await vi.runAllTimersAsync();
+      const outcome = await pending;
+
+      // 中断不再静默 return：delivery.failed 一条都不能少
+      expect(runtime.fail).toHaveBeenCalledOnce();
+      expect(runtime.fail).toHaveBeenCalledWith(
+        "event-1",
+        expect.objectContaining({ name: "AbortError", message: "aborted" }),
+        expect.objectContaining({ turnId: "turn-1", messageId: "assistant-1" }),
+      );
+      // 已经发出去的那一段仍要更新 delivered，插嘴判定才不会瞎
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]).toMatchObject({ text: "one", segmentsDelivered: 1, segmentsFailed: 0, partial: false });
+      expect(outcome).toMatchObject({ produced: true, segments: 1, error: "aborted" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
