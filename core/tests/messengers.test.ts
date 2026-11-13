@@ -172,7 +172,8 @@ describe("Messenger", () => {
       expect(vi.getTimerCount()).toBeGreaterThan(0);
       controller.abort();
       await vi.runAllTimersAsync();
-      await expect(pending).resolves.toBeUndefined();
+      // post() 现在返回投递结果（R2：内部通知链路要知道「到底说没说出口」）
+      await expect(pending).resolves.toMatchObject({ produced: false, segments: 0 });
       expect(bot.sendMessage).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();

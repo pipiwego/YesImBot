@@ -4,13 +4,21 @@ import { Universal } from "koishi";
 import type { Channels } from "../channels/index.js";
 import { type ChannelContext, deriveChannelKey, contextFromSession, contextFromRecord } from "../channels/index.js";
 import type { ChannelAllowRule, Config, PacingConfig } from "../config.js";
-import type { EventRecord, MessageRecord, RecordBase } from "../messages/index.js";
+import { formatElements } from "../messages/index.js";
+import type { DeliveredPayload, EventRecord, MessageRecord, RecordBase } from "../messages/index.js";
 import type { ChannelResources } from "../resources/index.js";
-import type { ChannelRuntime, PostOptions, RuntimeResult, Runtimes } from "../runtimes/index.js";
+import type { ChannelRuntime, NudgeOptions, PostOptions, RuntimeResult, Runtimes } from "../runtimes/index.js";
 
 type RunResult = Extract<RuntimeResult, { readonly kind: "run" }>;
 
 type DeliveryContext = { turnId: string; messageId: string; segmentIndex: number; segmentTotal: number };
+
+/** `post()` 的投递结果：是否真的产出了 assistant 文本并发出（供内部通知链路判定「到底说没说出口」）。 */
+export interface PostOutcome {
+  readonly produced: boolean;
+  readonly segments: number;
+  readonly error?: string;
+}
 
 export interface Translator {
   readonly platform: string;
@@ -21,7 +29,7 @@ export class Messenger {
   private readonly logger: Logger;
   private readonly translators = new Map<string, Translator>();
   private readonly sessions = new WeakSet<object>();
-  private readonly tasks = new Set<Promise<void>>();
+  private readonly tasks = new Set<Promise<unknown>>();
   private readonly deliveryTails = new Map<string, Promise<void>>();
   private readonly disposers: Array<() => unknown> = [];
   private closed = false;
@@ -62,8 +70,8 @@ export class Messenger {
     };
   }
 
-  public async post(event: EventRecord, options?: PostOptions): Promise<void> {
-    if (this.closed) return;
+  public async post(event: EventRecord, options?: PostOptions): Promise<PostOutcome> {
+    if (this.closed) return { produced: false, segments: 0, error: "messenger closed" };
     const bot = this.ctx.bots.find((candidate) => candidate.platform === event.platform && candidate.selfId === event.selfId);
     if (!bot) throw new Error(`No Bot is available for ${event.platform}:${event.selfId}`);
     const channel = await this.channels.resolve(contextFromRecord(event)!);
@@ -76,7 +84,38 @@ export class Messenger {
       result: result.kind,
       eventId: result.eventId,
     });
-    if (result.kind === "run") await this.track(this.deliverActive(bot, event.channel.id, runtime, result));
+    if (result.kind === "run") return this.track(this.deliverActive(bot, event.channel.id, runtime, result));
+    return { produced: false, segments: 0, error: `not-triggered:${result.kind}` };
+  }
+
+  public async nudge(ctx: ChannelContext, options?: NudgeOptions & { selfId?: string }): Promise<boolean> {
+    if (this.closed || !matchesAllowedChannel(ctx, this.config.allowedChannels)) return false;
+    const targetSelfId = options?.selfId ?? ctx.selfId;
+    const bot =
+      this.ctx.bots.find((candidate) => candidate.platform === ctx.platform && (!targetSelfId || candidate.selfId === targetSelfId)) ??
+      this.ctx.bots.find((candidate) => candidate.platform === ctx.platform);
+    if (!bot) return false;
+    try {
+      await this.channels.start();
+      await assertAssignee(this.ctx, ctx, bot.selfId);
+      const channel = await this.channels.resolve(ctx);
+      const runtime = await this.runtimes.get(channel, bot);
+      const result = await runtime.nudge(options);
+      this.logger.debug("messenger.nudge", {
+        platform: ctx.platform,
+        channelId: ctx.channelId,
+        result: result.kind,
+        eventId: result.eventId,
+      });
+      if (result.kind === "run") {
+        void this.track(this.deliverActive(bot, ctx.channelId, runtime, result));
+        return true;
+      }
+      return false;
+    } catch (cause) {
+      this.warn("messenger.nudge_failed", cause, ctx.platform);
+      return false;
+    }
   }
 
   public async stop(): Promise<void> {
@@ -129,26 +168,73 @@ export class Messenger {
   private async deliverPassive(session: Session, runtime: ChannelRuntime, result: RunResult): Promise<void> {
     const delivery = emptyDeliveryContext(result.eventId);
     await this.serializeDelivery(runtime.context, async () => {
+      const sent: string[] = [];
       try {
-        for await (const segment of this.pacedSegments(result, delivery)) await session.send([...segment]);
+        for await (const segment of this.pacedSegments(result, delivery, sent)) await session.send([...segment]);
       } catch (cause) {
         await this.failDelivery(runtime, result, delivery, cause);
+        return;
       }
+      this.emitDelivered(runtime.context, delivery, sent);
     });
   }
 
-  private async deliverActive(bot: Bot, channelId: string, runtime: ChannelRuntime, result: RunResult): Promise<void> {
+  private async deliverActive(bot: Bot, channelId: string, runtime: ChannelRuntime, result: RunResult): Promise<PostOutcome> {
     const delivery = emptyDeliveryContext(result.eventId);
+    let outcome: PostOutcome = { produced: false, segments: 0 };
     await this.serializeDelivery(runtime.context, async () => {
+      const sent: string[] = [];
+      // 只统计「sendMessage 真的返回了」的段数。pacedSegments 的 sink 是在 yield 之前
+      // 记的，用它当成功计数会把「首段就发失败」误判成「说了一半」，从而跳过兜底 → 丢稿。
+      let delivered = 0;
       try {
-        for await (const segment of this.pacedSegments(result, delivery)) await bot.sendMessage(channelId, [...segment]);
+        for await (const segment of this.pacedSegments(result, delivery, sent)) {
+          await bot.sendMessage(channelId, [...segment]);
+          delivered += 1;
+        }
       } catch (cause) {
+        outcome = { produced: false, segments: delivered, error: cause instanceof Error ? cause.message : String(cause) };
         await this.failDelivery(runtime, result, delivery, cause);
+        return;
       }
+      outcome = { produced: delivered > 0, segments: delivered };
+      this.emitDelivered(runtime.context, delivery, sent);
     });
+    return outcome;
   }
 
-  private async *pacedSegments(result: RunResult, delivery: DeliveryContext): AsyncIterable<readonly Element[]> {
+  /**
+   * `yesimbot/delivered` 此前只有监听者、没有任何发射点，
+   * 导致 will-policy 的 recentBotMsgIds / lastBotReplyAt 永远是空的，
+   * 「引用诗音的回复才触发」与「45 秒同人追问直通」双双失效。
+   */
+  private emitDelivered(ctx: ChannelContext, delivery: DeliveryContext, sent: readonly string[]): void {
+    if (sent.length === 0) return;
+    const text = sent.join("");
+    if (!text.trim()) return;
+    const payload: DeliveredPayload = {
+      platform: ctx.platform,
+      selfId: ctx.selfId ?? "",
+      channel: {
+        id: ctx.channelId,
+        type: ctx.type === "direct" ? Universal.Channel.Type.DIRECT : Universal.Channel.Type.TEXT,
+      },
+      messageId: delivery.messageId,
+      turnId: delivery.turnId,
+      text,
+    };
+    try {
+      this.ctx.emit("yesimbot/delivered", payload);
+    } catch (cause) {
+      this.warn("messenger.delivered_emit_failed", cause, ctx.platform);
+    }
+  }
+
+  private async *pacedSegments(
+    result: RunResult,
+    delivery: DeliveryContext,
+    sink?: string[],
+  ): AsyncIterable<readonly Element[]> {
     let elapsed = 0;
     for await (const output of result.output) {
       for (const [index, segment] of output.segments.entries()) {
@@ -168,6 +254,13 @@ export class Messenger {
         delivery.messageId = output.messageId;
         delivery.segmentIndex = index + 1;
         delivery.segmentTotal = output.segments.length;
+        if (sink) {
+          try {
+            sink.push(formatElements(segment));
+          } catch {
+            // 渲染失败不影响投递本身
+          }
+        }
         yield segment;
       }
     }
@@ -194,12 +287,18 @@ export class Messenger {
     }
   }
 
-  private async track(task: Promise<void>): Promise<void> {
-    this.tasks.add(task);
+  private async track<T>(task: Promise<T>): Promise<T> {
+    const tracked = task.then(
+      (value) => value,
+      (cause) => {
+        throw cause;
+      },
+    );
+    this.tasks.add(tracked);
     try {
-      await task;
+      return await tracked;
     } finally {
-      this.tasks.delete(task);
+      this.tasks.delete(tracked);
     }
   }
 
