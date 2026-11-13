@@ -57,6 +57,8 @@ export class Runtimes {
         config: this.config,
         plugins: await this.agents.setup(channel.context, bot),
         idleTimeout: this.config.session.compact.responseIdleMinutes * 60_000,
+        compactTriggerTokens: this.config.session.compact.triggerTokens,
+        compactFallbackTurns: this.config.session.compact.fallbackTurns,
         archiveMaxBytes: this.config.session.archive.maxKB * 1024,
       });
       try {
@@ -115,7 +117,7 @@ export class Runtimes {
         ? undefined
         : {
             model: this.resolveCompactModel(chat.model, channel.context),
-            personaName: "Athena",
+            personaName: "月见诗音",
             persona: await readPersona(this.config.basePath, this.ctx.logger("yesimbot/archive")),
           };
       await channel.conversation.archive(noSummary, input);
@@ -196,4 +198,4 @@ function runtimeKey(ctx: ChannelContext): ChannelKey {
   return deriveChannelKey(ctx);
 }
 
-export { type RuntimeResult, type PostOptions, type ChannelOutput, ChannelRuntime } from "./channel.js";
+export { type RuntimeResult, type PostOptions, type NudgeOptions, type ChannelOutput, ChannelRuntime } from "./channel.js";

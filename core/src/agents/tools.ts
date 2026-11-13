@@ -1,6 +1,6 @@
 import { jsonSchema, type AgentTool } from "@yesimbot/agent-runtime";
 import { generateText, type LanguageModel } from "ai";
-import type { Bot } from "koishi";
+import { h, type Bot, type Element } from "koishi";
 
 import { parseReply } from "../messages/index.js";
 import { prepareOutputSegments, ResourceReadError, type ChannelResources } from "../resources/index.js";
@@ -200,4 +200,178 @@ function formatBytes(length: number): string {
   if (length >= 1024 * 1024) return `${(length / (1024 * 1024)).toFixed(1)} MiB`;
   if (length >= 1024) return `${(length / 1024).toFixed(1)} KiB`;
   return `${length} B`;
+}
+
+// ── 合并转发聊天记录卡片 ────────────────────────────────────────────────
+// 长内容走卡片，避免在群里刷屏。发送前全部校验完，绝不发半张卡。
+const CARD_MAX_ENTRIES = 60;
+const CARD_MAX_DEPTH = 2;
+const CARD_MAX_ENTRY_TEXT = 4000;
+const CARD_MAX_TOTAL_TEXT = 12000;
+
+export type CardEntryInput = {
+  speaker?: string;
+  text?: string;
+  image?: string;
+  card?: { title?: string; entries?: CardEntryInput[] };
+};
+
+export type CardInput = { title?: string; entries: CardEntryInput[] };
+
+export type CardOutput =
+  | { ok: true; messageIds: string[]; summary: string }
+  | { ok: false; error: { name: string; message: string } };
+
+class CardError extends Error {
+  public constructor(
+    public readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = code;
+  }
+}
+
+function looksLikeUsableUri(uri: string): boolean {
+  return /^(base64:\/\/|data:[\w/.+-]+;base64,|https?:\/\/)/i.test(uri.trim());
+}
+
+function buildCardChildren(
+  entries: CardEntryInput[],
+  depth: number,
+  stats: { count: number; chars: number },
+  selfId: string,
+  selfName: string,
+): Element[] {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new CardError("CardEmpty", "entries 不能为空，卡片至少要有一条内容");
+  }
+  const children: Element[] = [];
+  for (const [index, raw] of entries.entries()) {
+    const at = `第 ${index + 1} 条`;
+    if (!raw || typeof raw !== "object") throw new CardError("CardBadEntry", `${at}不是对象`);
+    const filled = [raw.text, raw.image, raw.card].filter((v) => v !== undefined && v !== null);
+    if (filled.length === 0) throw new CardError("CardBadEntry", `${at}没有内容，需要 text / image / card 三选一`);
+    if (filled.length > 1) throw new CardError("CardBadEntry", `${at}同时填了多个内容字段，只能三选一`);
+
+    stats.count += 1;
+    if (stats.count > CARD_MAX_ENTRIES) {
+      throw new CardError("CardTooLong", `条目超过 ${CARD_MAX_ENTRIES} 条上限，请先精简`);
+    }
+
+    const speaker = (raw.speaker ?? "").trim() || selfName;
+    const speakerId = /^\d{5,12}$/.test(selfId) ? Number(selfId) : 0;
+    const author = h("author", { id: String(speakerId), name: speaker });
+    const body: Element[] = [];
+
+    if (typeof raw.text === "string") {
+      const text = raw.text;
+      if (text.length > CARD_MAX_ENTRY_TEXT) {
+        throw new CardError("CardTooLong", `${at}文字 ${text.length} 字，超过单条 ${CARD_MAX_ENTRY_TEXT} 字上限`);
+      }
+      stats.chars += text.length;
+      if (stats.chars > CARD_MAX_TOTAL_TEXT) {
+        throw new CardError("CardTooLong", `卡片总文字超过 ${CARD_MAX_TOTAL_TEXT} 字上限，请先精简`);
+      }
+      body.push(h("text", { content: text }));
+    } else if (typeof raw.image === "string") {
+      const uri = raw.image.trim();
+      if (!looksLikeUsableUri(uri)) {
+        throw new CardError("CardBadImage", `${at}的图片地址不可用，只支持 base64://、data:...;base64, 或 https://`);
+      }
+      body.push(h("img", { src: uri }));
+    } else if (raw.card) {
+      if (depth + 1 > CARD_MAX_DEPTH) {
+        throw new CardError("CardTooDeep", `卡片最多嵌套 ${CARD_MAX_DEPTH} 层，第 ${depth + 1} 层已经超了`);
+      }
+      body.push(
+        h("message", { forward: true }, ...buildCardChildren(raw.card.entries ?? [], depth + 1, stats, selfId, selfName)),
+      );
+    }
+
+    children.push(h("message", {}, author, ...body));
+  }
+  return children;
+}
+
+export function createSendChatRecordCardTool(
+  bot: Bot,
+  currentChannelId: string,
+  selfId: string,
+  onDelivered?: (messageId: string, text: string, count: number) => void,
+): AgentTool<CardInput, CardOutput> {
+  const selfName = (bot as unknown as { user?: { name?: string } }).user?.name || "诗音";
+  return {
+    name: "sendChatRecordCard",
+    description: [
+      "把一段较长的内容打包成一张 QQ『合并转发聊天记录』卡片发出，专门用来避免在群里刷屏。",
+      "只在内容确实太长、直接发会刷掉好几屏时使用；短回复直接正常输出即可。",
+      "每条 entries 只能填 text / image / card 其中一个。card 是嵌套卡片，最多 2 层。",
+      "卡片是独立一条消息。发完如果想再补一句说明，直接正常输出即可，会作为短消息单独发出。",
+      "重要：如果返回 ok:false，说明卡片没有发出去。这时只用一句话简短告诉对方这次没发成，绝对不要把卡片内容拆成长文本分条重发——那样正好造成你想避免的刷屏。",
+    ].join("\n"),
+    inputSchema: jsonSchema<CardInput>({
+      type: "object",
+      properties: {
+        title: { type: "string", description: "卡片标题，例如「诗音的检索笔记」。留空也能发。" },
+        entries: {
+          type: "array",
+          minItems: 1,
+          maxItems: CARD_MAX_ENTRIES,
+          description: "卡片里的每一条，按顺序显示成『谁说了什么』。",
+          items: {
+            type: "object",
+            properties: {
+              speaker: { type: "string", description: "这一条显示的名字。不填用你自己的名字。" },
+              text: { type: "string", description: "纯文字内容。" },
+              image: { type: "string", description: "图片地址，支持 base64:// 或 data:...;base64,。" },
+              card: {
+                type: "object",
+                description: "再套一张卡片（最多 2 层）。整条只能有 card，不能同时带 text。",
+                properties: {
+                  title: { type: "string" },
+                  entries: { type: "array", items: { type: "object" } },
+                },
+              },
+            },
+          },
+        },
+      },
+      required: ["entries"],
+    }),
+    execute: async ({ title, entries }) => {
+      let children: Element[];
+      const stats = { count: 0, chars: 0 };
+      try {
+        children = buildCardChildren(entries ?? [], 1, stats, selfId, selfName);
+      } catch (cause) {
+        if (cause instanceof CardError) return { ok: false, error: { name: cause.code, message: cause.message } };
+        return { ok: false, error: { name: "CardInvalid", message: cause instanceof Error ? cause.message : String(cause) } };
+      }
+
+      const element =
+        typeof title === "string" && title.trim()
+          ? h("message", { forward: true, title: title.trim() }, ...children)
+          : h("message", { forward: true }, ...children);
+
+      try {
+        const messageIds = await bot.sendMessage(currentChannelId, [element]);
+        if (!messageIds || messageIds.length === 0) {
+          return { ok: false, error: { name: "CardNotSent", message: "平台没有返回消息 id，卡片可能没发出去" } };
+        }
+        const summary = `已发出卡片${typeof title === "string" && title.trim() ? `「${title.trim()}」` : ""}，共 ${stats.count} 条。`;
+        onDelivered?.(String(messageIds[0] ?? ""), summary, stats.count);
+        return { ok: true, messageIds: messageIds.map(String), summary };
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        return {
+          ok: false,
+          error: {
+            name: cause instanceof Error ? cause.name : "CardSendFailed",
+            message: `${message}（卡片没有发出。用一句话简短告诉对方这次没发成，不要把卡片内容改成长文本重发。）`,
+          },
+        };
+      }
+    },
+  };
 }

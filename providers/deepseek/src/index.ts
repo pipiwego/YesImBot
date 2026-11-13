@@ -67,8 +67,8 @@ export function apply(ctx: Context, config: Config) {
         level === "none"
           ? { thinking: { type: "disabled" } }
           : level === "auto"
-            ? { thinking: { type: "adaptive" } }
-            : { thinking: { type: "enabled" }, reasoningEffort: level };
+            ? { thinking: { type: "enabled" } }
+            : ({ thinking: { type: "enabled" }, reasoningEffort: level } as unknown as DeepSeekLanguageModelOptions);
       return wrapLanguageModel({
         model: client.chat(actualId),
         middleware: [defaultSettingsMiddleware({ settings: { providerOptions: { deepseek: opts } } })],

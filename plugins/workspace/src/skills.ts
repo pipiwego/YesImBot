@@ -51,9 +51,12 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
   return lines.join("\n");
 }
 
-/** Load skills from all configured locations with deduplication and collision diagnostics. */
+/** Load skills from all configured locations with deduplication, scope filtering, and collision diagnostics. */
 export async function loadSkills(options: LoadSkillsOptions): Promise<LoadSkillsResult> {
-  const { cwd, skillPaths } = options;
+  const { cwd, skillPaths, allowedScopes, skillBlacklist } = options;
+  const allowedSet =
+    allowedScopes && allowedScopes.length > 0 ? new Set(allowedScopes.map((s) => s.toLowerCase().trim()).filter(Boolean)) : null;
+  const blacklistSet = new Set((skillBlacklist ?? []).map((s) => s.trim()).filter(Boolean));
   const skillMap = new Map<string, Skill>();
   const realPathSet = new Set<string>();
   const allDiagnostics: ResourceDiagnostic[] = [];
@@ -62,6 +65,11 @@ export async function loadSkills(options: LoadSkillsOptions): Promise<LoadSkills
   async function addSkills(result: LoadSkillsResult) {
     allDiagnostics.push(...result.diagnostics);
     for (const skill of result.skills) {
+      if (blacklistSet.has(skill.name)) continue;
+      if (allowedSet) {
+        const skillScope = (skill.scope || "worker").toLowerCase().trim();
+        if (!allowedSet.has(skillScope) && skillScope !== "all") continue;
+      }
       let realPath: string;
       try {
         realPath = await realpath(skill.filePath);
@@ -248,8 +256,17 @@ async function loadSkillFromFile(filePath: string, rootDir?: string): Promise<{ 
       return { skill: null, diagnostics };
     }
 
+    const scope = typeof frontmatter.scope === "string" && frontmatter.scope.trim() ? frontmatter.scope.trim() : "worker";
+
     return {
-      skill: { name, description, filePath: realFilePath, baseDir: skillDir, disableModelInvocation: frontmatter["disable-model-invocation"] === true },
+      skill: {
+        name,
+        description,
+        scope,
+        filePath: realFilePath,
+        baseDir: skillDir,
+        disableModelInvocation: frontmatter["disable-model-invocation"] === true,
+      },
       diagnostics,
     };
   } catch (error) {

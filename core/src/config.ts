@@ -41,6 +41,14 @@ export const Config: Schema<Config> = Schema.intersect([
     session: Schema.object({
       compact: Schema.object({
         responseIdleMinutes: Schema.number().min(0).default(120).description("BOT 响应后的压缩等待时长（分钟）；0 = 禁用"),
+        triggerTokens: Schema.number()
+          .min(0)
+          .default(120000)
+          .description("上一轮输入 token 达到该值即强制压缩（覆盖热群与长私聊）；0 = 禁用"),
+        fallbackTurns: Schema.number()
+          .min(0)
+          .default(80)
+          .description("距上次压缩累计轮数达到该值即强制压缩（token 统计缺失时的兜底）；0 = 禁用"),
         minMessages: Schema.number().min(1).default(20).description("自动压缩所需的最少消息数"),
         maxFailures: Schema.number().min(1).default(3).description("自动压缩连续失败上限"),
         model: Schema.dynamic("registry.chatModels").description("压缩模型；留空则使用默认对话模型"),
@@ -68,6 +76,8 @@ export interface PacingConfig {
 
 export interface SessionCompactConfig {
   responseIdleMinutes: number;
+  triggerTokens: number;
+  fallbackTurns: number;
   minMessages: number;
   maxFailures: number;
   model: string | undefined;

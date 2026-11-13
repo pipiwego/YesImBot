@@ -11,11 +11,19 @@ const DATA_URL = /^data:([^;,]+)(;base64)?,([\s\S]*)$/;
 const BASE64_URL = /^base64:\/\/([\s\S]*)$/;
 const MAX_IMAGES = 4;
 const MAX_BYTES_PER_IMAGE = 5 * 1024 * 1024;
-const MAX_FILES = 2;
+const MAX_FILES = 5;
 
-/** 1 MiB of UTF-8 text already exceeds the read tool's character truncation; larger is useless to the model. */
-const MAX_BYTES_PER_FILE = 1024 * 1024;
-const MAX_TOTAL_BYTES = 10 * 1024 * 1024;
+const MAX_BYTES_PER_FILE = 50 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 80 * 1024 * 1024;
+const ARCHIVE_FILE_EXTENSIONS: readonly string[] = [
+  "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst",
+  "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub", "mobi",
+  "mp4", "mov", "mkv", "webm", "avi",
+  "mp3", "wav", "flac", "m4a", "ogg", "aac",
+  "heic", "heif", "webp", "psd", "png", "jpg", "jpeg", "gif", "bmp", "tiff",
+  "ttf", "otf", "woff", "woff2",
+  "sqlite", "db", "parquet", "arrow", "npy", "npz", "pkl"
+] as const;
 const RESOURCE_TIMEOUT_MS = 10_000;
 
 /** Cheap pre-filter so a large binary is never downloaded; the UTF-8 check after download is authoritative. */
@@ -26,7 +34,7 @@ const TEXT_FILE_EXTENSIONS: readonly string[] = [ "txt", "md", "markdown", "rst"
 const AMBIGUOUS_TYPES: readonly string[] = ["application/octet-stream", "binary/octet-stream", "application/unknown"];
 const BINARY_KINDS: readonly string[] = ["image", "audio", "video", "font"] as const;
 
-type ResourceKind = "image" | "text";
+type ResourceKind = "image" | "text" | "binary";
 
 interface ResourceBudget {
   images: number;
@@ -39,15 +47,17 @@ interface ResourceProbe {
   type: string | null;
 }
 
-/** Persists inbound image and restricted text-file elements while the Session is live. */
+/** Persists inbound image, media, and file elements while the Session is live. */
 export async function persistElements(ctx: Context, elements: readonly Element[], resources: ChannelResources): Promise<Element[]> {
   const budget: ResourceBudget = { images: 0, files: 0, bytes: 0 };
   const prepared = await Promise.all(elements.map((element) => persistElement(ctx, element, resources.assets, budget)));
   const logger = resourceLogger(ctx);
   const imageCount = countElements(prepared, "img");
   const fileCount = countElements(prepared, "file");
-  if ((imageCount || fileCount) && logger) {
-    logger.debug("resources.input.persisted", { imageCount, fileCount });
+  const videoCount = countElements(prepared, "video");
+  const audioCount = countElements(prepared, "audio");
+  if ((imageCount || fileCount || videoCount || audioCount) && logger) {
+    logger.debug("resources.input.persisted", { imageCount, fileCount, videoCount, audioCount });
   }
   return prepared;
 }
@@ -55,6 +65,7 @@ export async function persistElements(ctx: Context, elements: readonly Element[]
 async function persistElement(ctx: Context, element: Element, store: AssetStore, budget: ResourceBudget): Promise<Element> {
   if (element.type === "img") return storeImage(ctx, element, store, budget);
   if (element.type === "file") return storeTextFile(ctx, element, store, budget);
+  if (element.type === "video" || element.type === "audio") return storeBinaryMedia(ctx, element, store, budget);
   if (element.children.length === 0) return element;
   return h(element.type, element.attrs, await Promise.all(element.children.map((child) => persistElement(ctx, child, store, budget))));
 }
@@ -77,14 +88,34 @@ async function storeImage(ctx: Context, element: Element, store: AssetStore, bud
   }
 }
 
+async function storeBinaryMedia(ctx: Context, element: Element, store: AssetStore, budget: ResourceBudget): Promise<Element> {
+  const src = typeof element.attrs.src === "string" ? element.attrs.src : typeof element.attrs.url === "string" ? element.attrs.url : undefined;
+  if (!src || budget.files >= MAX_FILES) return element;
+  budget.files += 1;
+  try {
+    const data = await loadResource(ctx, src, "binary", Math.min(MAX_BYTES_PER_FILE, MAX_TOTAL_BYTES - budget.bytes));
+    if (budget.bytes + data.byteLength > MAX_TOTAL_BYTES) return element;
+    budget.bytes += data.byteLength;
+    const filename = fileName(element);
+    return h(element.type, {
+      id: await store.put(data),
+      ...(filename ? { title: filename } : {}),
+    });
+  } catch {
+    return element;
+  }
+}
+
 async function storeTextFile(ctx: Context, element: Element, store: AssetStore, budget: ResourceBudget): Promise<Element> {
-  if (typeof element.attrs.src !== "string" || budget.files >= MAX_FILES) return element;
+  const src = typeof element.attrs.src === "string" ? element.attrs.src : typeof element.attrs.url === "string" ? element.attrs.url : undefined;
+  if (!src || budget.files >= MAX_FILES) return element;
   const filename = fileName(element);
   if (!filename || !hasTextFileExtension(filename)) return element;
   budget.files += 1;
+  const isBinaryExt = isArchiveFileExtension(filename);
   try {
-    const data = await loadResource(ctx, element.attrs.src, "text", Math.min(MAX_BYTES_PER_FILE, MAX_TOTAL_BYTES - budget.bytes));
-    if (budget.bytes + data.byteLength > MAX_TOTAL_BYTES || !isUtf8Text(data)) return element;
+    const data = await loadResource(ctx, src, isBinaryExt ? "binary" : "text", Math.min(MAX_BYTES_PER_FILE, MAX_TOTAL_BYTES - budget.bytes));
+    if (budget.bytes + data.byteLength > MAX_TOTAL_BYTES || (!isBinaryExt && !isUtf8Text(data))) return element;
     budget.bytes += data.byteLength;
     return h("file", { id: await store.put(data), title: filename });
   } catch {
@@ -93,7 +124,7 @@ async function storeTextFile(ctx: Context, element: Element, store: AssetStore, 
 }
 
 function fileName(element: Element): string | undefined {
-  for (const key of ["title", "file"] as const) {
+  for (const key of ["title", "file", "name"] as const) {
     const value = element.attrs[key];
     if (typeof value === "string" && value.length > 0) return value;
   }
@@ -103,7 +134,14 @@ function fileName(element: Element): string | undefined {
 function hasTextFileExtension(filename: string): boolean {
   const dot = filename.lastIndexOf(".");
   if (dot <= 0 || dot === filename.length - 1) return false;
-  return TEXT_FILE_EXTENSIONS.includes(filename.slice(dot + 1).toLowerCase());
+  const ext = filename.slice(dot + 1).toLowerCase();
+  return TEXT_FILE_EXTENSIONS.includes(ext) || ARCHIVE_FILE_EXTENSIONS.includes(ext);
+}
+
+function isArchiveFileExtension(filename: string): boolean {
+  const dot = filename.lastIndexOf(".");
+  if (dot <= 0 || dot === filename.length - 1) return false;
+  return ARCHIVE_FILE_EXTENSIONS.includes(filename.slice(dot + 1).toLowerCase());
 }
 
 function isUtf8Text(bytes: Uint8Array): boolean {
@@ -159,7 +197,7 @@ async function headProbe(ctx: Context, url: string): Promise<ResourceProbe | nul
 }
 
 function matchesKind(type: string | null, kind: ResourceKind): boolean {
-  if (type === null) return true;
+  if (type === null || kind === "binary") return true;
   if (kind === "image") return type.startsWith("image/") || AMBIGUOUS_TYPES.includes(type);
   return !BINARY_KINDS.some((prefix) => type.startsWith(`${prefix}/`));
 }

@@ -23,6 +23,9 @@ export default class WorkspacePlugin {
   public static inject = ["yesimbot"];
 
   public static Config: Schema<WorkspacePluginConfig> = Schema.object({
+    disableBashTools: Schema.boolean().default(false).description("禁用前台 Bash 工具（仅加载轻量技能目录）"),
+    allowedScopes: Schema.array(Schema.string()).default(["frontend", "both"]).description("允许加载的技能 scope 列表"),
+    skillBlacklist: Schema.array(Schema.string()).default([]).description("禁止前台加载的技能黑名单"),
     bash: Schema.object({
       cwd: Schema.string().default("/home/workspace").description("虚拟文件系统默认目录"),
       mounts: Schema.array(
@@ -77,14 +80,19 @@ export default class WorkspacePlugin {
 
     const sandbox = this.getSandboxConfig();
     const skillPaths = (this.config.skillPaths ?? []).map((path) => resolve(this.ctx.baseDir, path));
-    const loadResult = await loadSkills({ skillPaths, cwd: this.ctx.baseDir });
+    const loadResult = await loadSkills({
+      skillPaths,
+      cwd: this.ctx.baseDir,
+      allowedScopes: this.config.allowedScopes,
+      skillBlacklist: this.config.skillBlacklist,
+    });
     for (const diagnostic of loadResult.diagnostics) {
       this.logger.warn(`技能加载诊断: ${diagnostic.message} (${diagnostic.path ?? "unknown"})`);
     }
     this.skills.splice(0, this.skills.length, ...loadResult.skills);
     const skillCatalog = this.skills.map((skill) => ({ ...skill }));
     for (const skill of skillCatalog) {
-      this.logger.info(`加载技能: ${skill.name} (${skill.filePath})`);
+      this.logger.info(`加载技能: ${skill.name} [scope=${skill.scope ?? "both"}] (${skill.filePath})`);
     }
 
     const userMounts: MountSpec[] = [...(sandbox?.mounts ?? [])];
@@ -107,14 +115,16 @@ export default class WorkspacePlugin {
       };
       this.disposeReaders.push(this.ctx.yesimbot.resource.use(skillReader));
     }
-    const workspaceReader: ResourceReader = {
-      scheme: "workspace",
-      prompt: WORKSPACE_SCHEME_PROMPT,
-      setup(resources, uri, options) {
-        return owner.openWorkspace(resources, uri, options);
-      },
-    };
-    this.disposeReaders.push(this.ctx.yesimbot.resource.use(workspaceReader));
+    if (!this.config.disableBashTools) {
+      const workspaceReader: ResourceReader = {
+        scheme: "workspace",
+        prompt: WORKSPACE_SCHEME_PROMPT,
+        setup(resources, uri, options) {
+          return owner.openWorkspace(resources, uri, options);
+        },
+      };
+      this.disposeReaders.push(this.ctx.yesimbot.resource.use(workspaceReader));
+    }
     this.disposeAgentPlugin = this.ctx.yesimbot.agent.use(this);
 
     this.logger.success("Workspace plugin started");
@@ -123,8 +133,15 @@ export default class WorkspacePlugin {
   public async setup(scope: ChannelContext): Promise<AgentPlugin | null> {
     const sandbox = this.sandbox;
     if (!sandbox) return null;
-    const resources = await this.ctx.yesimbot.resource.get(scope);
     const runtimeSkills = this.skillCatalog.map((skill) => ({ ...skill }));
+    if (this.config.disableBashTools) {
+      return {
+        name: "workspace",
+        tools: async () => [],
+        appendSystemPrompt: async () => [formatSkillsForPrompt(runtimeSkills)].filter(Boolean),
+      } satisfies AgentPlugin;
+    }
+    const resources = await this.ctx.yesimbot.resource.get(scope);
     const runtimeMounts = this.normalizedMounts;
     return {
       name: "workspace",

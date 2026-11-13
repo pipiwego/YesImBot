@@ -20,6 +20,9 @@ export interface SandboxBashConfig {
 }
 
 export interface WorkspacePluginConfig {
+  readonly disableBashTools?: boolean;
+  readonly allowedScopes?: string[];
+  readonly skillBlacklist?: string[];
   readonly bash?: SandboxBashConfig;
   readonly skillPaths?: string[];
 }
@@ -32,6 +35,7 @@ export interface WorkspaceMountSummary {
 export interface SkillFrontmatter {
   name?: string;
   description?: string;
+  scope?: string;
   "disable-model-invocation"?: boolean;
   [key: string]: unknown;
 }
@@ -39,6 +43,7 @@ export interface SkillFrontmatter {
 export interface Skill {
   name: string;
   description: string;
+  scope?: string;
   filePath: string;
   baseDir: string;
   disableModelInvocation: boolean;
@@ -61,4 +66,8 @@ export interface LoadSkillsOptions {
   cwd: string;
   /** Explicit skill paths (files or directories). */
   skillPaths: string[];
+  /** Allowed frontmatter `scope` values (e.g. ["frontend", "both"]). */
+  allowedScopes?: string[];
+  /** Blacklisted skill names to exclude from loading. */
+  skillBlacklist?: string[];
 }

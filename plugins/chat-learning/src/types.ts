@@ -90,13 +90,39 @@ export interface GlobalChannelStat {
 }
 
 export interface GlobalPattern {
+  /** 首个 kind，兼容老读者；新读者请用 kinds。 */
   readonly kind: GlobalPatternKind;
+  /** 首个 intent，兼容老读者；新读者请用 intents。 */
   readonly intent: string;
+  readonly kinds?: readonly GlobalPatternKind[];
+  readonly intents?: readonly string[];
   readonly phrase: string;
   readonly channels: readonly GlobalChannelStat[];
   readonly firstSeenAt: number;
   readonly lastSeenAt: number;
+  /** 同一语义簇内的其他措辞（≤4 条），仅 cluster 档写入。 */
+  readonly variants?: readonly string[];
+  /** 重要性实数，∈[0,1]；缺失按 0.5 处理。 */
+  readonly salience?: number;
+  /** 观测计数，只增不减（不参与排序）。 */
+  readonly hits?: number;
   readonly embedding?: readonly number[];
+}
+
+/** 边界型记忆：max 聚合、不衰减、不受 minGlobalChannels 约束。 */
+export interface BoundaryMemory {
+  readonly id: string;
+  readonly text: string;
+  /** 首次出现的频道指纹。 */
+  readonly channelKey: string;
+  readonly firstSeenAt: number;
+  readonly lastSeenAt: number;
+  /** max 聚合，重复出现不提升。 */
+  readonly strength: number;
+  /** 命中次数，只用于观测，不进排序。 */
+  readonly hits: number;
+  /** 置时间戳即失效。 */
+  readonly revokedAt?: number;
 }
 
 export interface GlobalChainSample {
@@ -121,6 +147,7 @@ export interface GlobalRuleBank {
   readonly patterns: readonly GlobalPattern[];
   readonly chains: readonly GlobalChainPattern[];
   readonly templates: readonly MemeTemplate[];
+  readonly boundaries?: readonly BoundaryMemory[];
 }
 
 export interface MemeTemplate {
@@ -163,6 +190,8 @@ export interface ChatLearningConfig {
   readonly summaryModel: string | undefined;
   readonly embeddingModel: string | undefined;
   readonly embeddingSimilarity: number;
+  /** 语义聚簇阈值（默认 0.85），低于 embeddingSimilarity 时把措辞记入 variants。 */
+  readonly clusterSimilarity?: number;
   readonly maxModelThreads: number;
   readonly maxModelThreadMessages: number;
   readonly reflectionModel: string | undefined;
