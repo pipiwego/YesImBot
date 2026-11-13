@@ -183,3 +183,8 @@ references/
 skills-lock.json
 yarn.lock
 yesimbot-setup.log
+
+# 备份文件不入库
+*.bak
+*.bak_*
+*.bak.*
